@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-beam-search"
+version = "0.1.0"
+description = "Beam search plugin for vLLM v1 with CoW block table forking"
+requires-python = ">=3.10"
+dependencies = [
+    "vllm",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
