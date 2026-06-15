@@ -84,9 +84,6 @@ def _sampler() -> BeamSearchMRV2Sampler:
             eos_token_id=2,
             no_repeat_ngram_size=3,
             prompt_tokens=[0, 0],
-            tokens=[[31806, 1979, 75], [38, 222, 45]],
-            cum=[0.0, _INIT_NEG],
-            fork_src=[0, 1],
             active=[True, True],
         )
     }
@@ -119,6 +116,45 @@ def _pooled_state(
     return state, pool.tokens[slot]
 
 
+def _gpu_transitions(
+    *,
+    gids: tuple[str, ...],
+    prefix_lens: tuple[int, ...],
+    active_counts: tuple[int, ...],
+    req_idx_by_group: torch.Tensor,
+    dst_slots: torch.Tensor,
+    src_slots: torch.Tensor,
+    tokens: torch.Tensor,
+) -> _BeamTransitionsGpu:
+    group_count, beam_width = req_idx_by_group.shape
+    return _BeamTransitionsGpu(
+        gids=gids,
+        steps=tuple(0 for _gid in gids),
+        prefix_lens=prefix_lens,
+        prompt_lens=tuple(0 for _gid in gids),
+        active_counts=active_counts,
+        req_idx_by_group=req_idx_by_group,
+        dst_slots=dst_slots,
+        src_slots=src_slots,
+        fork_src=torch.empty(
+            (group_count, beam_width),
+            dtype=torch.long,
+            device=DEVICE,
+        ),
+        active_mask=torch.empty(
+            (group_count, beam_width),
+            dtype=torch.bool,
+            device=DEVICE,
+        ),
+        tokens=tokens,
+        cum=torch.zeros(
+            (group_count, beam_width),
+            dtype=torch.float32,
+            device=DEVICE,
+        ),
+    )
+
+
 def test_gpu_worker_rewrite_uses_worker_prefix_and_preserves_suffix() -> None:
     sampler = _sampler()
     # Simulate async CPU/worker token lag: the physical source row has not
@@ -128,31 +164,23 @@ def test_gpu_worker_rewrite_uses_worker_prefix_and_preserves_suffix() -> None:
         dtype=torch.int32,
         device=DEVICE,
     )
-    input_batch = SimpleNamespace(
-        req_ids=["gid:beam:0", "gid:beam:1"],
-        idx_mapping_np=np.array([0, 1], dtype=np.int32),
-    )
-    transition = {
-        "dst_slots": torch.tensor([1], dtype=torch.long, device=DEVICE),
-        "src_slots": torch.tensor([0], dtype=torch.long, device=DEVICE),
+    transitions = _gpu_transitions(
+        gids=("gid",),
         # Immediate MRV2 sampler transitions use full worker prefix length:
         # decoder prompt [0, 0] + generated [31806, 1979, 75].
-        "prefix_len": 5,
-        "tokens": torch.tensor(
-            [
-                [0, 0, 31806, 1979, 75, 99],
-                [0, 0, 31806, 1979, 75, 88],
-            ],
+        prefix_lens=(5,),
+        active_counts=(1,),
+        req_idx_by_group=torch.tensor([[0, 1]], dtype=torch.long, device=DEVICE),
+        dst_slots=torch.tensor([[1, 0]], dtype=torch.long, device=DEVICE),
+        src_slots=torch.tensor([[0, 0]], dtype=torch.long, device=DEVICE),
+        tokens=torch.tensor(
+            [[[0, 0, 31806, 1979, 75, 99],
+              [0, 0, 31806, 1979, 75, 88]]],
             dtype=torch.int32,
             device=DEVICE,
         ),
-    }
-
-    req_idx_by_group = sampler._gpu_req_indices_by_group(input_batch)
-    sampler._apply_gpu_worker_rewrites(
-        {"gid": transition},
-        req_idx_by_group,
     )
+    sampler._apply_gpu_worker_rewrites(transitions)
 
     req_states = sampler.base_sampler.req_states
     assert req_states.all_token_ids.gpu.cpu().tolist() == [
@@ -171,22 +199,16 @@ def test_gpu_worker_rewrite_uses_worker_prefix_and_preserves_suffix() -> None:
 
 def test_gpu_worker_rewrite_resets_zero_prefix_rows() -> None:
     sampler = _sampler()
-    input_batch = SimpleNamespace(
-        req_ids=["gid:beam:0", "gid:beam:1"],
-        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+    transitions = _gpu_transitions(
+        gids=("gid",),
+        prefix_lens=(0,),
+        active_counts=(2,),
+        req_idx_by_group=torch.tensor([[0, 1]], dtype=torch.long, device=DEVICE),
+        dst_slots=torch.tensor([[0, 1]], dtype=torch.long, device=DEVICE),
+        src_slots=torch.tensor([[0, 0]], dtype=torch.long, device=DEVICE),
+        tokens=torch.zeros((1, 2, 1), dtype=torch.int32, device=DEVICE),
     )
-    transition = {
-        "dst_slots": torch.tensor([0, 1], dtype=torch.long, device=DEVICE),
-        "src_slots": torch.tensor([0, 0], dtype=torch.long, device=DEVICE),
-        "prefix_len": 0,
-        "tokens": torch.empty((2, 0), dtype=torch.int32, device=DEVICE),
-    }
-
-    req_idx_by_group = sampler._gpu_req_indices_by_group(input_batch)
-    sampler._apply_gpu_worker_rewrites(
-        {"gid": transition},
-        req_idx_by_group,
-    )
+    sampler._apply_gpu_worker_rewrites(transitions)
 
     req_states = sampler.base_sampler.req_states
     assert req_states.total_len.gpu.cpu().tolist() == [0, 0]
@@ -252,48 +274,40 @@ def test_gpu_worker_rewrite_batches_same_prefix_groups() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            tokens=[[], []],
-            cum=[0.0, _INIT_NEG],
-            fork_src=[0, 1],
             active=[True, True],
         )
         for gid in ("g0", "g1")
     }
-    input_batch = SimpleNamespace(
-        req_ids=[
-            "g0:beam:0",
-            "g0:beam:1",
-            "g1:beam:0",
-            "g1:beam:1",
-        ],
-        idx_mapping_np=np.array([0, 1, 2, 3], dtype=np.int32),
-    )
-    req_idx_by_group = sampler._gpu_req_indices_by_group(input_batch)
-
-    transitions = {
-        "g0": {
-            "dst_slots": torch.tensor([1], dtype=torch.long, device=DEVICE),
-            "src_slots": torch.tensor([0], dtype=torch.long, device=DEVICE),
-            "prefix_len": 3,
-            "tokens": torch.tensor(
+    transitions = _gpu_transitions(
+        gids=("g0", "g1"),
+        prefix_lens=(3, 3),
+        active_counts=(1, 1),
+        req_idx_by_group=torch.tensor(
+            [[0, 1], [2, 3]],
+            dtype=torch.long,
+            device=DEVICE,
+        ),
+        dst_slots=torch.tensor(
+            [[1, 0], [1, 0]],
+            dtype=torch.long,
+            device=DEVICE,
+        ),
+        src_slots=torch.tensor(
+            [[0, 0], [0, 0]],
+            dtype=torch.long,
+            device=DEVICE,
+        ),
+        tokens=torch.tensor(
+            [
                 [[0, 0, 10, 100], [0, 0, 10, 101]],
-                dtype=torch.int32,
-                device=DEVICE,
-            ),
-        },
-        "g1": {
-            "dst_slots": torch.tensor([1], dtype=torch.long, device=DEVICE),
-            "src_slots": torch.tensor([0], dtype=torch.long, device=DEVICE),
-            "prefix_len": 3,
-            "tokens": torch.tensor(
                 [[0, 0, 20, 102], [0, 0, 20, 103]],
-                dtype=torch.int32,
-                device=DEVICE,
-            ),
-        },
-    }
+            ],
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+    )
 
-    sampler._apply_gpu_worker_rewrites(transitions, req_idx_by_group)
+    sampler._apply_gpu_worker_rewrites(transitions)
 
     req_states = sampler.base_sampler.req_states
     assert req_states.all_token_ids.gpu.cpu().tolist() == [
@@ -310,10 +324,13 @@ def test_gpu_worker_rewrite_batches_same_prefix_groups() -> None:
         [7, 8, 20, 102],
         [7, 8, 20, 103],
     ]
-    assert len(sampler._pending_computed_resets) == 1
-    reset_rows, reset_prefix = sampler._pending_computed_resets[0]
-    assert reset_rows.cpu().tolist() == [1, 3]
-    assert reset_prefix == 3
+    req_states.num_computed_tokens.gpu[:] = torch.tensor(
+        [4, 4, 4, 4],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    sampler._apply_pending_computed_resets()
+    assert req_states.num_computed_tokens.gpu.cpu().tolist() == [4, 3, 4, 3]
 
 
 def test_gpu_worker_rewrite_copies_partial_kv_block() -> None:
@@ -380,7 +397,7 @@ def test_gpu_worker_rewrite_copies_partial_kv_block() -> None:
         cum=torch.zeros((1, 2), dtype=torch.float32, device=DEVICE),
     )
 
-    sampler._apply_gpu_worker_rewrites(transitions, req_idx_by_group)
+    sampler._apply_gpu_worker_rewrites(transitions)
 
     assert sampler.block_tables.block_tables[0].gpu.cpu().tolist() == [
         [10, 20, 0],
@@ -423,9 +440,6 @@ def test_select_masks_padded_inactive_beams() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            tokens=[[], [], [], []],
-            cum=[0.0, _INIT_NEG, 0.0, _INIT_NEG],
-            fork_src=[0, 1, 2, 3],
             active=[True, False, True, False],
         )
     }
@@ -507,9 +521,6 @@ def test_beam_view_reorders_interleaved_requests() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            tokens=[[], []],
-            cum=[0.0, _INIT_NEG],
-            fork_src=[0, 1],
             active=[True, True],
         )
         for gid in ("g0", "g1")
@@ -555,9 +566,6 @@ def test_select_handles_mixed_lengths_in_one_bucket() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=2,
             prompt_tokens=[],
-            tokens=[[], []],
-            cum=[0.0, _INIT_NEG],
-            fork_src=[0, 1],
             active=[True, True],
         )
         for gid in ("g0", "g1")
@@ -658,9 +666,6 @@ def test_select_materializes_eos_completions() -> None:
             eos_token_id=2,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            tokens=[[], []],
-            cum=[0.0, _INIT_NEG],
-            fork_src=[0, 1],
             active=[True, True],
         )
         for gid in ("g0", "g1")

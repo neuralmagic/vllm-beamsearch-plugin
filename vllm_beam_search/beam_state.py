@@ -51,14 +51,6 @@ class BeamGroup:
     # the scheduler uses this to suppress duplicate emissions.
     finalized: bool = False
 
-    @property
-    def active_beams(self) -> set[str]:
-        return {
-            request_id
-            for idx, request_id in enumerate(self.beam_request_ids)
-            if idx not in self.finished_beam_indices
-        }
-
     def normalized(self, score: float, length: int) -> float:
         """HF-compatible length normalization: score / length**length_penalty."""
         if self.length_penalty == 0.0 or length <= 0:

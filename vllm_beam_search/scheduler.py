@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import copy
 import os
-import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -44,30 +43,6 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
-
-_DEBUG = bool(int(os.getenv("VLLM_BEAM_DEBUG", "0")))
-_TRACE = bool(int(os.getenv("VLLM_BEAM_TRACE", "0")))
-_SUMMARY = bool(int(os.getenv("VLLM_BEAM_SUMMARY", "0")))
-_EARLY_STOP_MIN_COMPLETIONS = int(
-    os.getenv("VLLM_BEAM_EARLY_STOP_MIN_COMPLETIONS", "0")
-)
-_HOTPATH_TIMING = bool(int(os.getenv("VLLM_V1_HOTPATH_TIMING", "0")))
-_HOTPATH_MIN_MS = float(os.getenv("VLLM_V1_HOTPATH_TIMING_MIN_MS", "0.0"))
-_COW_PARTIAL_BLOCKS = bool(int(os.getenv("VLLM_BEAM_COW_PARTIAL_BLOCKS", "1")))
-
-
-def _hotpath_log(component: str, dt_s: float, **fields: object) -> None:
-    if not _HOTPATH_TIMING:
-        return
-    dt_ms = dt_s * 1000.0
-    if dt_ms < _HOTPATH_MIN_MS:
-        return
-    extra = " ".join(f"{k}={v}" for k, v in fields.items())
-    print(
-        f"[V1_HOTPATH] component={component} dt_ms={dt_ms:.3f}"
-        + (f" {extra}" if extra else ""),
-        flush=True,
-    )
 
 
 def _install_worker_history_rewrite_hooks() -> None:
@@ -200,26 +175,6 @@ class _PrefixSnapshot:
     blocks_by_manager: dict[int, list[Any]]
 
 
-@dataclass
-class _UpdateStats:
-    groups: int = 0
-    finalized: int = 0
-    rebases: int = 0
-
-
-@dataclass
-class _SummaryStats:
-    public_adds: int = 0
-    child_adds: int = 0
-    finalizes: int = 0
-    parent_outputs: int = 0
-    child_finishes: int = 0
-    cleanups: int = 0
-    external_finishes: int = 0
-    missing_runtime_waits: int = 0
-    no_best_finalizes: int = 0
-
-
 class BeamSearchScheduler(Scheduler):
     """V1 scheduler running `beam_width` sibling requests per beam group."""
 
@@ -264,8 +219,6 @@ class BeamSearchScheduler(Scheduler):
         # Indices of the decoder (self-attention) KV managers — everything
         # that is not cross-attention. Computed lazily on first use.
         self._self_attn_mgr_idxs: list[int] | None = None
-        self._summary_stats = _SummaryStats()
-        self._last_summary_s = 0.0
 
     def _update_after_schedule(self, scheduler_output: "SchedulerOutput") -> None:
         super()._update_after_schedule(scheduler_output)
@@ -346,7 +299,6 @@ class BeamSearchScheduler(Scheduler):
             beam_width=beam_width,
             length_penalty=float(extra.get("length_penalty", 1.0)),
         )
-        self._summary_stats.public_adds += 1
         self.beam_groups[request.request_id] = group
 
         for i in range(beam_width):
@@ -355,11 +307,6 @@ class BeamSearchScheduler(Scheduler):
             group.beam_requests.append(child)
             self.beam_to_group[child.request_id] = request.request_id
             super().add_request(child)
-            self._summary_stats.child_adds += 1
-
-        if _DEBUG:
-            print(f"[BEAM] add_request orig={request.request_id} "
-                  f"bw={beam_width} children={group.beam_request_ids}", flush=True)
 
     def _make_beam_child(
         self, orig: Request, beam_index: int, beam_width: int
@@ -432,7 +379,6 @@ class BeamSearchScheduler(Scheduler):
         )
 
         finished = super().finish_requests(expanded_ids, finished_status)
-        self._summary_stats.external_finishes += len(finished)
         if not cleanup_groups:
             return finished
 
@@ -514,24 +460,14 @@ class BeamSearchScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def schedule(self) -> "SchedulerOutput":
-        t0 = time.perf_counter() if _HOTPATH_TIMING else 0.0
         scheduler_output = super().schedule()
         self._clamp_async_beam_decode_chunks(scheduler_output)
-        if _HOTPATH_TIMING:
-            _hotpath_log(
-                "beam_scheduler_schedule_total",
-                time.perf_counter() - t0,
-                groups=len(self.beam_groups),
-                scheduled=len(scheduler_output.num_scheduled_tokens),
-                tokens=scheduler_output.total_num_scheduled_tokens,
-            )
         return scheduler_output
 
     def _clamp_async_beam_decode_chunks(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        total_trimmed = 0
         for req_id, scheduled in list(
             scheduler_output.num_scheduled_tokens.items()
         ):
@@ -555,106 +491,38 @@ class BeamSearchScheduler(Scheduler):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
-            total_trimmed += trimmed
-
-        if total_trimmed and _DEBUG:
-            print(
-                f"[BEAM] clamped async decode tokens trimmed={total_trimmed}",
-                flush=True,
-            )
 
     def update_from_output(
         self,
         scheduler_output: "SchedulerOutput",
         model_runner_output: "ModelRunnerOutput",
     ) -> dict[int, EngineCoreOutputs]:
-        t_total = time.perf_counter() if _HOTPATH_TIMING else 0.0
         outputs = super().update_from_output(scheduler_output, model_runner_output)
-        t_plugin = time.perf_counter() if _HOTPATH_TIMING else 0.0
 
         finished_children = self._suppress_child_outputs(outputs)
         if not self.beam_groups:
-            if _HOTPATH_TIMING:
-                _hotpath_log(
-                    "beam_scheduler_update_total",
-                    time.perf_counter() - t_total,
-                    groups=0,
-                    outputs=sum(len(eco.outputs) for eco in outputs.values()),
-                )
             return outputs
 
         transitions = self._beam_transitions_from_output(model_runner_output)
-        if _DEBUG:
-            print(
-                f"[BEAM] update groups={list(self.beam_groups)} "
-                f"transitions={list(transitions)} "
-                f"outputs={[(ci, len(eco.outputs)) for ci, eco in outputs.items()]}",
-                flush=True,
-            )
-
-        stats = _UpdateStats()
 
         for group in list(self.beam_groups.values()):
             if group.finalized:
                 continue
-            stats.groups += 1
 
             transition = transitions.get(group.orig_request_id)
-            source = transition
             if transition is not None:
                 self._drain_beam_transition(group, transition)
 
-            active_slots = self._active_slots(group, source)
+            active_slots = self._active_slots(group, transition)
             if self._should_finalize_group(
-                group, source, active_slots, finished_children
+                group, transition, active_slots, finished_children
             ):
-                self._finalize_group(group, outputs, source)
-                stats.finalized += 1
+                self._finalize_group(group, outputs, transition)
                 continue
 
-            stats.rebases += self._apply_fork_plan(group, source, active_slots)
+            self._apply_fork_plan(group, transition, active_slots)
 
-        if _HOTPATH_TIMING:
-            _hotpath_log(
-                "beam_scheduler_plugin_update",
-                time.perf_counter() - t_plugin,
-                groups=stats.groups,
-                finalized=stats.finalized,
-                rebases=stats.rebases,
-            )
-            _hotpath_log(
-                "beam_scheduler_update_total",
-                time.perf_counter() - t_total,
-                groups=stats.groups,
-                finalized=stats.finalized,
-                rebases=stats.rebases,
-                outputs=sum(len(eco.outputs) for eco in outputs.values()),
-            )
-        self._maybe_log_summary()
         return outputs
-
-    def _maybe_log_summary(self, force: bool = False) -> None:
-        if not _SUMMARY:
-            return
-        now = time.monotonic()
-        if not force and now - self._last_summary_s < 1.0:
-            return
-        self._last_summary_s = now
-        stats = self._summary_stats
-        print(
-            "[BEAM_SUMMARY] "
-            f"adds={stats.public_adds} child_adds={stats.child_adds} "
-            f"finalizes={stats.finalizes} parent_outputs={stats.parent_outputs} "
-            f"child_finishes={stats.child_finishes} cleanups={stats.cleanups} "
-            f"external_finishes={stats.external_finishes} "
-            f"missing_runtime_waits={stats.missing_runtime_waits} "
-            f"no_best_finalizes={stats.no_best_finalizes} "
-            f"live_groups={len(self.beam_groups)} "
-            f"beam_children={len(self.beam_to_group)} "
-            f"base_unfinished={super().get_num_unfinished_requests()} "
-            f"running={len(self.running)} waiting={len(self.waiting)}",
-            flush=True,
-        )
 
     def _suppress_child_outputs(
         self,
@@ -695,7 +563,11 @@ class BeamSearchScheduler(Scheduler):
             return {}
         return {transition.group_id: transition for transition in transitions}
 
-    def _drain_beam_transition(self, group: BeamGroup, transition: Any) -> None:
+    def _drain_beam_transition(
+        self,
+        group: BeamGroup,
+        transition: BeamTransition,
+    ) -> None:
         for tokens, cum in transition.completions:
             self._add_completion(group, list(tokens), cum)
         self._finish_inactive_slots(group, transition)
@@ -703,18 +575,15 @@ class BeamSearchScheduler(Scheduler):
     def _should_finalize_group(
         self,
         group: BeamGroup,
-        gr: Any,
+        transition: BeamTransition | None,
         active_slots: list[int],
         finished_children: set[str],
     ) -> bool:
-        # HF/V0 early_stopping=True finalizes once beam_width complete
-        # hypotheses exist. Larger thresholds are diagnostic-only.
-        min_completions = max(group.beam_width, _EARLY_STOP_MIN_COMPLETIONS)
-        if len(group.completed) >= min_completions:
+        # HF/V0 early_stopping=True finalizes once beam_width hypotheses exist.
+        if len(group.completed) >= group.beam_width:
             return True
 
-        if gr is None:
-            self._summary_stats.missing_runtime_waits += 1
+        if transition is None:
             return False
 
         if not active_slots:
@@ -760,35 +629,27 @@ class BeamSearchScheduler(Scheduler):
             ]
         return self._self_attn_mgr_idxs
 
-    def _active_slots(self, group: BeamGroup, gr: Any) -> list[int]:
-        if gr is None:
-            return list(range(group.beam_width))
-        active_slots = getattr(gr, "active_slots", None)
-        if active_slots is not None:
-            return [
-                slot
-                for slot in active_slots[:group.beam_width]
-                if slot not in group.finished_beam_indices
-            ]
-        active = getattr(gr, "active", None)
-        if active is None:
+    def _active_slots(
+        self,
+        group: BeamGroup,
+        transition: BeamTransition | None,
+    ) -> list[int]:
+        if transition is None:
             return list(range(group.beam_width))
         return [
-            slot
-            for slot, is_active in enumerate(active[:group.beam_width])
-            if is_active and slot not in group.finished_beam_indices
+            slot for slot in transition.active_slots[:group.beam_width]
+            if slot not in group.finished_beam_indices
         ]
 
     def _finish_inactive_slots(
         self,
         group: BeamGroup,
-        gr: Any,
+        transition: BeamTransition,
     ) -> None:
-        inactive_slots = list(getattr(gr, "inactive_slots", []) or [])
-        if not inactive_slots:
+        if not transition.inactive_slots:
             return
 
-        for slot in inactive_slots:
+        for slot in transition.inactive_slots:
             if slot in group.finished_beam_indices:
                 continue
             if slot >= len(group.beam_request_ids):
@@ -800,47 +661,41 @@ class BeamSearchScheduler(Scheduler):
             group.finished_beam_indices.add(slot)
             self.beam_to_group.pop(child_id, None)
 
-        if hasattr(gr, "inactive_slots") and not hasattr(gr, "step_id"):
-            gr.inactive_slots = []
-
     def _apply_fork_plan(
         self,
         group: BeamGroup,
-        gr: Any,
+        transition: BeamTransition | None,
         active_slots: list[int],
-    ) -> int:
-        t0 = time.perf_counter() if _HOTPATH_TIMING else 0.0
-        if gr is None:
-            return 0
-        rebases = self._fork_rebases(group, gr, active_slots)
+    ) -> None:
+        if transition is None:
+            return
+        rebases = self._fork_rebases(group, transition, active_slots)
         if not rebases:
-            return 0
+            return
 
         mgrs = self.kv_cache_manager.coordinator.single_type_managers
         self_idxs = self._self_attn_managers()
         snapshots = self._snapshot_fork_sources(
-            group, gr, rebases, self_idxs, mgrs
+            group, transition, rebases, self_idxs, mgrs
         )
 
         for dst, src in rebases:
-            self._rebase_slot(group, gr, dst, snapshots[src], self_idxs, mgrs)
-
-        if _HOTPATH_TIMING:
-            _hotpath_log(
-                "beam_scheduler_apply_fork_plan",
-                time.perf_counter() - t0,
-                rebases=len(rebases),
-                active=len(active_slots),
+            self._rebase_slot(
+                group,
+                transition,
+                dst,
+                snapshots[src],
+                self_idxs,
+                mgrs,
             )
-        return len(rebases)
 
     @staticmethod
     def _fork_rebases(
         group: BeamGroup,
-        source: Any,
+        transition: BeamTransition,
         active_slots: list[int],
     ) -> list[tuple[int, int]]:
-        fork_src = source.fork_src
+        fork_src = transition.fork_src
         active_slot_set = set(active_slots)
         return [
             (dst, fork_src[dst])
@@ -855,13 +710,13 @@ class BeamSearchScheduler(Scheduler):
     def _snapshot_fork_sources(
         self,
         group: BeamGroup,
-        source: Any,
+        transition: BeamTransition,
         rebases: list[tuple[int, int]],
         self_idxs: list[int],
         mgrs: Any,
     ) -> dict[int, _PrefixSnapshot]:
         snapshots: dict[int, _PrefixSnapshot] = {}
-        output_prefix_len = int(getattr(source, "prefix_len", 0) or 0)
+        output_prefix_len = int(transition.prefix_len)
 
         for _dst, src in rebases:
             if src in snapshots:
@@ -896,7 +751,7 @@ class BeamSearchScheduler(Scheduler):
             has_partial_block = kv_prefix_len % self.block_size != 0
 
             blocks_by_manager[manager_index] = shared_blocks
-            if _COW_PARTIAL_BLOCKS and has_partial_block:
+            if has_partial_block:
                 num_computed_tokens = max(num_computed_tokens, kv_prefix_len)
             else:
                 num_computed_tokens = max(num_computed_tokens, shareable_tokens)
@@ -909,7 +764,7 @@ class BeamSearchScheduler(Scheduler):
     def _rebase_slot(
         self,
         group: BeamGroup,
-        source: Any,
+        transition: BeamTransition,
         dst: int,
         src_snap: _PrefixSnapshot,
         self_idxs: list[int],
@@ -934,13 +789,8 @@ class BeamSearchScheduler(Scheduler):
                 prefix_blocks=len(new_blocks),
             )
 
-        new_output = self._rewrite_rebased_request(dst_req, source, dst, n_prefix)
+        self._rewrite_rebased_request(dst_req, transition, dst, n_prefix)
         self.prev_step_scheduled_req_ids.discard(dst_id)
-
-        if _DEBUG:
-            print(f"[BEAM] rebase dst={dst} n_prefix={n_prefix} "
-                  f"out_len={len(new_output)} last_tok={new_output[-1]}",
-                  flush=True)
 
     @staticmethod
     def _replace_request_blocks(
@@ -969,11 +819,11 @@ class BeamSearchScheduler(Scheduler):
     def _rewrite_rebased_request(
         self,
         dst_req: Request,
-        gr: Any,
+        transition: BeamTransition,
         dst: int,
         num_computed_tokens: int,
-    ) -> list[int]:
-        new_output = list(gr.tokens[dst])  # [bos, ..., new_tok]
+    ) -> None:
+        new_output = list(transition.tokens[dst])
         dst_req._output_token_ids.clear()
         dst_req._output_token_ids.extend(new_output)
         dst_req._all_token_ids.clear()
@@ -986,7 +836,6 @@ class BeamSearchScheduler(Scheduler):
         if getattr(dst_req, "_block_hasher", None) is not None:
             dst_req.block_hashes = []
             dst_req.update_block_hashes()
-        return new_output
 
     # ------------------------------------------------------------------
     # Finalize
@@ -996,71 +845,29 @@ class BeamSearchScheduler(Scheduler):
         self,
         group: BeamGroup,
         outputs: dict[int, EngineCoreOutputs],
-        gr: Any,
+        transition: BeamTransition | None,
     ) -> None:
-        self._summary_stats.finalizes += 1
-        if _TRACE:
-            self._trace_final_candidates(group, gr)
-
-        best, finish_reason = self._select_final_beam(group, gr)
+        best, finish_reason = self._select_final_beam(group, transition)
         if best is not None:
             final_tokens = self._tokens_with_eos(group, best.tokens)
             self._emit_parent_output(group, outputs, final_tokens, finish_reason)
-            self._summary_stats.parent_outputs += 1
-            if _DEBUG:
-                print(f"[BEAM] finalize gid={group.orig_request_id} "
-                      f"norm={group.normalized(best.cum_score, best.length):.3f} "
-                      f"len={best.length} tokens={final_tokens[:20]}", flush=True)
         else:
-            self._summary_stats.no_best_finalizes += 1
             logger.warning("Beam group %s finalized with no beams.",
                            group.orig_request_id)
 
         self._finish_group_children(group)
         self._cleanup_group(group)
 
-    def _trace_final_candidates(
-        self,
-        group: BeamGroup,
-        gr: Any,
-    ) -> None:
-        for idx, beam in enumerate(group.completed):
-            print(
-                f"[BEAM_TRACE plugin] final-completed idx={idx} "
-                f"finish={beam.finish_reason} cum={beam.cum_score:.6f} "
-                f"len={beam.length} "
-                f"norm={group.normalized(beam.cum_score, beam.length):.6f} "
-                f"seq={beam.tokens}",
-                flush=True,
-            )
-
-        if gr is None:
-            return
-
-        for slot in self._active_slots(group, gr):
-            toks = gr.tokens[slot] if slot < len(gr.tokens) else []
-            if not toks:
-                continue
-            length = self._beam_length(group, toks)
-            cum = gr.cum[slot]
-            print(
-                f"[BEAM_TRACE plugin] final-active slot={slot} "
-                f"cum={cum:.6f} len={length} "
-                f"norm={group.normalized(cum, length):.6f} "
-                f"seq={toks}",
-                flush=True,
-            )
-
     def _select_final_beam(
         self,
         group: BeamGroup,
-        gr: Any,
+        transition: BeamTransition | None,
     ) -> tuple[CompletedBeam | None, FinishReason]:
         best = group.best_completed()
         if best is not None:
             return best, FinishReason.STOP
 
-        live = self._best_live_beam(group, gr)
+        live = self._best_live_beam(group, transition)
         if live is not None:
             return live, FinishReason.LENGTH
 
@@ -1069,28 +876,28 @@ class BeamSearchScheduler(Scheduler):
     def _best_live_beam(
         self,
         group: BeamGroup,
-        gr: Any,
+        transition: BeamTransition | None,
     ) -> CompletedBeam | None:
-        if gr is None:
+        if transition is None:
             return None
 
         best_slot, best_norm = None, float("-inf")
-        for slot in self._active_slots(group, gr):
-            toks = gr.tokens[slot] if slot < len(gr.tokens) else []
+        for slot in self._active_slots(group, transition):
+            toks = transition.tokens[slot] if slot < len(transition.tokens) else []
             if not toks:
                 continue
             length = self._beam_length(group, toks)
-            norm = group.normalized(gr.cum[slot], length)
+            norm = group.normalized(transition.cum[slot], length)
             if norm > best_norm:
                 best_norm, best_slot = norm, slot
 
         if best_slot is None:
             return None
 
-        tokens = list(gr.tokens[best_slot])
+        tokens = list(transition.tokens[best_slot])
         return CompletedBeam(
             tokens=tokens,
-            cum_score=gr.cum[best_slot],
+            cum_score=transition.cum[best_slot],
             length=self._beam_length(group, tokens),
             finish_reason="length",
         )
@@ -1133,11 +940,9 @@ class BeamSearchScheduler(Scheduler):
         Scheduler.finish_requests(
             self, group.beam_request_ids, RequestStatus.FINISHED_STOPPED
         )
-        self._summary_stats.child_finishes += len(group.beam_request_ids)
 
     def _cleanup_group(self, group: BeamGroup) -> None:
         group.finalized = True
-        self._summary_stats.cleanups += 1
         for bid in group.beam_request_ids:
             self.beam_to_group.pop(bid, None)
         self.beam_groups.pop(group.orig_request_id, None)

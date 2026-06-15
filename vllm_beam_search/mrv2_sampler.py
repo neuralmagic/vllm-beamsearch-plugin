@@ -23,9 +23,6 @@ from .beam_types import _INIT_NEG, BeamRuntime, BeamTransition
 
 BEAM_TRANSITIONS_OUTPUT = "vllm_beam_search.transitions"
 _SYNC_CHECK = os.getenv("VLLM_BEAM_GPU_SYNC_CHECK")
-_BLOCK_TRACE = bool(int(os.getenv("VLLM_BEAM_BLOCK_TRACE", "0")))
-_BLOCK_TRACE_STEPS = int(os.getenv("VLLM_BEAM_BLOCK_TRACE_STEPS", "24"))
-_BLOCK_TRACE_WIDTH = int(os.getenv("VLLM_BEAM_BLOCK_TRACE_WIDTH", "12"))
 _NEG_INF = float("-inf")
 _SelectEntry = tuple[str, BeamRuntime, dict[str, Any]]
 _SelectKey = tuple[int, int, int | None]
@@ -89,37 +86,6 @@ def _empty_beam_view() -> _BeamView:
             dtype=torch.bool,
             pin_memory=True,
         ),
-    )
-
-
-@triton.jit
-def _copy_prefix_rows_kernel(
-    src,
-    dst,
-    src_rows,
-    dst_rows,
-    n_cols: tl.constexpr,
-    src_stride0,
-    src_stride1,
-    dst_stride0,
-    dst_stride1,
-    BLOCK_N: tl.constexpr,
-) -> None:
-    row_idx = tl.program_id(0)
-    col_block = tl.program_id(1)
-    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = offsets < n_cols
-
-    src_row = tl.load(src_rows + row_idx)
-    dst_row = tl.load(dst_rows + row_idx)
-    values = tl.load(
-        src + src_row * src_stride0 + offsets * src_stride1,
-        mask=mask,
-    )
-    tl.store(
-        dst + dst_row * dst_stride0 + offsets * dst_stride1,
-        values,
-        mask=mask,
     )
 
 
@@ -682,33 +648,6 @@ def _beam_state_rewrite_kernel(
         )
 
 
-def _copy_prefix_rows(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    src_rows: torch.Tensor,
-    dst_rows: torch.Tensor,
-    n_cols: int,
-) -> None:
-    """Copy row prefixes on GPU without materializing block IDs on CPU."""
-    if n_cols <= 0 or dst_rows.numel() == 0:
-        return
-
-    block_n = min(triton.next_power_of_2(n_cols), 1024)
-    grid = (dst_rows.numel(), triton.cdiv(n_cols, block_n))
-    _copy_prefix_rows_kernel[grid](
-        src,
-        dst,
-        src_rows,
-        dst_rows,
-        n_cols,
-        src.stride(0),
-        src.stride(1),
-        dst.stride(0),
-        dst.stride(1),
-        BLOCK_N=block_n,
-    )
-
-
 def _copy_cpu_values_to_gpu(
     values: Any,
     *,
@@ -781,14 +720,6 @@ def _copy_kv_pages(
         scratch.stride(0),
         BLOCK_N=block_n,
     )
-
-
-def _cat_tensors(values: list[torch.Tensor]) -> torch.Tensor:
-    """Return the lone tensor or concatenate a non-empty tensor list."""
-    assert values
-    if len(values) == 1:
-        return values[0]
-    return torch.cat(values)
 
 
 class _BeamGroupStatePool:
@@ -1193,7 +1124,6 @@ class BeamSearchMRV2Sampler:
         self._gpu_group_state: dict[str, dict[str, Any]] = {}
         self._gpu_state_pools: dict[int, _BeamGroupStatePool] = {}
         self._transition_buffer_pool = _TransitionBufferPool()
-        self._block_gather_trace_count = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_sampler, name)
@@ -1250,12 +1180,8 @@ class BeamSearchMRV2Sampler:
                 eos_token_id=int(eos) if eos is not None else None,
                 no_repeat_ngram_size=no_repeat,
                 prompt_tokens=list(prompt_token_ids or []),
-                tokens=[[] for _ in range(beam_width)],
-                cum=[_INIT_NEG] * beam_width,
-                fork_src=list(range(beam_width)),
                 active=[True] * beam_width,
             )
-            gr.cum[0] = 0.0
             self.groups[gid] = gr
             self._init_gpu_group_state(gid, gr)
 
@@ -1370,13 +1296,7 @@ class BeamSearchMRV2Sampler:
         )
 
         if transitions:
-            req_idx_by_group = transitions.req_idx_by_group
-            if req_idx_by_group is None:
-                req_idx_by_group = self._gpu_req_indices_by_group(
-                    input_batch,
-                    transitions,
-                )
-            self._apply_gpu_worker_rewrites(transitions, req_idx_by_group)
+            self._apply_gpu_worker_rewrites(transitions)
             async_outputs = {
                 BEAM_TRANSITIONS_OUTPUT: AsyncBeamTransitions(
                     transitions,
@@ -1802,174 +1722,16 @@ class BeamSearchMRV2Sampler:
             valid_beam_mask_cpu=valid_beam_mask_cpu,
         )
 
-    def _gpu_req_indices_by_group(
-        self,
-        input_batch: InputBatch,
-        transitions: _BeamTransitionsGpu | None = None,
-    ) -> dict[str, torch.Tensor] | torch.Tensor:
-        """Build GPU request indices for each beam group slot."""
-        req_states = self.base_sampler.req_states
-        device = req_states.all_token_ids.gpu.device
-        if transitions is not None:
-            if transitions.req_idx_by_group is not None:
-                return transitions.req_idx_by_group
-            group_to_idx = {
-                gid: group_idx
-                for group_idx, gid in enumerate(transitions.gids)
-            }
-            beam_width = int(transitions.dst_slots.shape[1])
-            req_idx_cpu = [[-1] * beam_width for _gid in transitions.gids]
-            for batch_idx, req_id in enumerate(input_batch.req_ids):
-                entry = self.req_to_group.get(req_id)
-                if entry is None:
-                    continue
-                gid, slot = entry
-                group_idx = group_to_idx.get(gid)
-                if group_idx is None or not (0 <= slot < beam_width):
-                    continue
-                req_idx_cpu[group_idx][slot] = int(
-                    input_batch.idx_mapping_np[batch_idx]
-                )
-            return _copy_cpu_values_to_gpu(
-                req_idx_cpu,
-                dtype=torch.long,
-                device=device,
-            )
-
-        req_idx_by_group: dict[str, list[int]] = {}
-        for batch_idx, req_id in enumerate(input_batch.req_ids):
-            entry = self.req_to_group.get(req_id)
-            if entry is None:
-                continue
-            gid, slot = entry
-            gr = self.groups.get(gid)
-            if gr is None or not (0 <= slot < gr.beam_width):
-                continue
-            req_idx_by_slot = req_idx_by_group.get(gid)
-            if req_idx_by_slot is None:
-                req_idx_by_slot = [-1] * gr.beam_width
-                req_idx_by_group[gid] = req_idx_by_slot
-            req_idx_by_slot[slot] = int(input_batch.idx_mapping_np[batch_idx])
-
-        return {
-            gid: _copy_cpu_values_to_gpu(
-                req_idx_list,
-                dtype=torch.long,
-                device=device,
-            )
-            for gid, req_idx_list in req_idx_by_group.items()
-        }
-
     def _apply_gpu_worker_rewrites(
         self,
-        transitions: dict[str, dict[str, Any]] | _BeamTransitionsGpu,
-        req_idx_by_group: dict[str, torch.Tensor] | torch.Tensor,
-    ) -> None:
-        """Apply beam history rewrites to MRV2 worker token and block state."""
-        if self.block_tables is None or not self.self_attn_group_indices:
-            return
-        if isinstance(transitions, _BeamTransitionsGpu):
-            assert isinstance(req_idx_by_group, torch.Tensor)
-            self._apply_gpu_worker_rewrites_from_transitions(
-                transitions,
-                req_idx_by_group,
-            )
-            return
-
-        req_states = self.base_sampler.req_states
-        rewrite_buckets: dict[int, list[tuple[
-            dict[str, Any],
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-        ]]] = {}
-        for gid, transition in transitions.items():
-            req_idx_by_slot = req_idx_by_group.get(gid)
-            if req_idx_by_slot is None:
-                continue
-            dst_slots = transition["dst_slots"]
-            src_slots = transition["src_slots"]
-            prefix_len = int(transition["prefix_len"])
-            dst_req_idx = req_idx_by_slot[dst_slots]
-            src_req_idx = req_idx_by_slot[src_slots]
-            rewrite_buckets.setdefault(prefix_len, []).append((
-                transition,
-                dst_slots,
-                src_slots,
-                dst_req_idx,
-                src_req_idx,
-            ))
-
-        for prefix_len, entries in rewrite_buckets.items():
-            dst_req_idx = _cat_tensors([entry[3] for entry in entries])
-            req_states.total_len.gpu.index_fill_(0, dst_req_idx, prefix_len)
-            req_states.num_computed_tokens.gpu.index_fill_(
-                0, dst_req_idx, prefix_len
-            )
-            self._pending_computed_resets.append((
-                dst_req_idx.clone(),
-                prefix_len,
-            ))
-            if prefix_len <= 0:
-                continue
-
-            if len(entries) == 1:
-                transition, dst_slots, _src_slots, _dst_req_idx, src_req_idx = (
-                    entries[0]
-                )
-                token_source = transition["tokens"].to(
-                    req_states.all_token_ids.gpu.dtype
-                )
-                token_src_indices = dst_slots
-            else:
-                token_source = torch.cat([
-                    entry[0]["tokens"][entry[1], :prefix_len].to(
-                        req_states.all_token_ids.gpu.dtype
-                    )
-                    for entry in entries
-                ])
-                token_src_indices = torch.arange(
-                    token_source.shape[0],
-                    dtype=torch.long,
-                    device=token_source.device,
-                )
-                src_req_idx = _cat_tensors([entry[4] for entry in entries])
-
-            _copy_prefix_rows(
-                src=token_source,
-                dst=req_states.all_token_ids.gpu,
-                src_rows=token_src_indices,
-                dst_rows=dst_req_idx,
-                n_cols=prefix_len,
-            )
-
-            for group_idx in self.self_attn_group_indices:
-                block_size = int(self.block_tables.block_sizes[group_idx])
-                prefix_blocks = prefix_len // block_size
-                if prefix_blocks <= 0:
-                    continue
-                table = self.block_tables.block_tables[group_idx].gpu
-                block_prefix = table[src_req_idx, :prefix_blocks].clone()
-                block_prefix_indices = torch.arange(
-                    block_prefix.shape[0],
-                    dtype=torch.long,
-                    device=block_prefix.device,
-                )
-                _copy_prefix_rows(
-                    src=block_prefix,
-                    dst=table,
-                    src_rows=block_prefix_indices,
-                    dst_rows=dst_req_idx,
-                    n_cols=prefix_blocks,
-                )
-
-    def _apply_gpu_worker_rewrites_from_transitions(
-        self,
         transitions: _BeamTransitionsGpu,
-        req_idx_by_group: torch.Tensor,
     ) -> None:
         """Apply transition rewrites with fixed plugin launch count."""
+        if self.block_tables is None or not self.self_attn_group_indices:
+            return
+        req_idx_by_group = transitions.req_idx_by_group
+        if req_idx_by_group is None:
+            raise RuntimeError("MRV2 beam transitions must include request indices")
         req_states = self.base_sampler.req_states
         group_count = len(transitions.gids)
         if group_count == 0:
@@ -2169,51 +1931,6 @@ class BeamSearchMRV2Sampler:
             seen.add(key)
             caches.append(cache)
         return caches
-
-    def trace_gathered_block_tables(
-        self,
-        input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-    ) -> None:
-        if (
-            not _BLOCK_TRACE
-            or self._block_gather_trace_count >= _BLOCK_TRACE_STEPS
-        ):
-            return
-
-        for batch_idx, req_id in enumerate(input_batch.req_ids):
-            entry = self.req_to_group.get(req_id)
-            if entry is None:
-                continue
-            gid, beam_idx = entry
-            req_idx = int(input_batch.idx_mapping_np[batch_idx])
-            for group_idx in self.self_attn_group_indices:
-                if group_idx >= len(block_tables):
-                    continue
-                count = int(
-                    self.block_tables.num_blocks.np[group_idx, req_idx]
-                    if self.block_tables is not None
-                    else _BLOCK_TRACE_WIDTH
-                )
-                width = min(max(count, 0), _BLOCK_TRACE_WIDTH)
-                vals = (
-                    block_tables[group_idx][batch_idx, :width]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                print(
-                    "[BEAM_BLOCK_TRACE gather] "
-                    f"gid={gid} beam={beam_idx} input_idx={batch_idx} "
-                    f"req_idx={req_idx} group={group_idx} blocks={vals} "
-                    f"count={count} "
-                    f"scheduled={int(input_batch.num_scheduled_tokens[batch_idx])} "
-                    f"ncomp_np={int(input_batch.num_computed_tokens_np[batch_idx])}",
-                    flush=True,
-                )
-                self._block_gather_trace_count += 1
-                if self._block_gather_trace_count >= _BLOCK_TRACE_STEPS:
-                    return
 
     def apply_pending_rewrites(self) -> None:
         self._apply_pending_computed_resets()
