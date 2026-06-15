@@ -55,3 +55,21 @@ def test_replace_request_blocks_preserves_async_suffix() -> None:
     assert [block.ref_cnt for block in old_blocks[:5]] == [0, 0, 0, 0, 0]
     assert old_blocks[5].ref_cnt == 1
     assert [block.ref_cnt for block in shared_prefix] == [2, 2, 2, 2, 2]
+
+
+def test_snapshot_source_prefix_keeps_partial_cow_computed() -> None:
+    blocks = [FakeBlock(i) for i in [10, 20]]
+    mgr = FakeManager([])
+    mgr.req_to_blocks["src"] = blocks
+    scheduler = BeamSearchScheduler.__new__(BeamSearchScheduler)
+    scheduler.block_size = 4
+
+    snapshot = scheduler._snapshot_source_prefix(
+        src_id="src",
+        kv_prefix_len=5,
+        self_idxs=[0],
+        mgrs=[mgr],
+    )
+
+    assert [block.block_id for block in snapshot.blocks_by_manager[0]] == [10]
+    assert snapshot.num_computed_tokens == 5

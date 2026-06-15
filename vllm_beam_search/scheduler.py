@@ -12,12 +12,12 @@ Per step (`update_from_output`):
   3. If `beam_width` hypotheses are complete -> early stop (HF
      early_stopping=True): emit one EngineCoreOutput for the original
      request id and finish all sibling children.
-  4. Otherwise execute the LP's fork plan: for each slot whose
+  4. Otherwise execute the sampler's fork plan: for each slot whose
      `fork_src != slot`, rebase that slot's decoder (self-attention)
-     KV onto the parent's shareable prefix blocks by rewriting the block
-     table and refcounts. With one-token KV blocks this is a direct
-     full-prefix rewrite. Cross-attention (encoder) KV is identical across
-     beams and left untouched.
+     KV onto the parent's shareable full prefix blocks. For larger blocks,
+     the worker copies the source partial block into the destination's
+     private partial block. Cross-attention (encoder) KV is identical
+     across beams and left untouched.
 """
 from __future__ import annotations
 
@@ -53,6 +53,7 @@ _EARLY_STOP_MIN_COMPLETIONS = int(
 )
 _HOTPATH_TIMING = bool(int(os.getenv("VLLM_V1_HOTPATH_TIMING", "0")))
 _HOTPATH_MIN_MS = float(os.getenv("VLLM_V1_HOTPATH_TIMING_MIN_MS", "0.0"))
+_COW_PARTIAL_BLOCKS = bool(int(os.getenv("VLLM_BEAM_COW_PARTIAL_BLOCKS", "1")))
 
 
 def _hotpath_log(component: str, dt_s: float, **fields: object) -> None:
@@ -142,7 +143,7 @@ def _patch_flash_attn_hopper_block_size_one() -> None:
 
 
 def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
-    """Give MRV2 ModelState access to block tables for custom samplers."""
+    """Give MRV2 custom samplers access to worker KV/block state."""
     try:
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
         from vllm.v1.kv_cache_interface import CrossAttentionSpec
@@ -154,7 +155,7 @@ def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
 
     original_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
 
-    def _bind_beam_block_tables(self) -> None:
+    def _bind_beam_worker_state(self) -> None:
         model_state = getattr(self, "model_state", None)
         block_tables = getattr(self, "block_tables", None)
         if model_state is None or block_tables is None:
@@ -167,14 +168,25 @@ def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
         )
         setattr(model_state, "_vllm_beam_block_tables", block_tables)
         setattr(model_state, "_vllm_beam_self_attn_groups", self_attn_groups)
+        setattr(model_state, "_vllm_beam_kv_cache_config", self.kv_cache_config)
+        setattr(
+            model_state,
+            "_vllm_beam_forward_context",
+            self.compilation_config.static_forward_context,
+        )
 
         beam_sampler = getattr(model_state, "beam_sampler", None)
         if beam_sampler is not None and hasattr(beam_sampler, "set_block_tables"):
             beam_sampler.set_block_tables(block_tables, self_attn_groups)
+        if beam_sampler is not None and hasattr(beam_sampler, "set_kv_caches"):
+            beam_sampler.set_kv_caches(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+            )
 
     def patched_initialize_kv_cache(self, kv_cache_config):
         original_initialize_kv_cache(self, kv_cache_config)
-        _bind_beam_block_tables(self)
+        _bind_beam_worker_state(self)
 
     GPUModelRunner.initialize_kv_cache = patched_initialize_kv_cache
     GPUModelRunner._vllm_beam_history_rewrite_patched = True
@@ -881,9 +893,13 @@ class BeamSearchScheduler(Scheduler):
             n_full_blocks = kv_prefix_len // self.block_size
             shared_blocks = blocks[:n_full_blocks]
             shareable_tokens = len(shared_blocks) * self.block_size
+            has_partial_block = kv_prefix_len % self.block_size != 0
 
             blocks_by_manager[manager_index] = shared_blocks
-            num_computed_tokens = max(num_computed_tokens, shareable_tokens)
+            if _COW_PARTIAL_BLOCKS and has_partial_block:
+                num_computed_tokens = max(num_computed_tokens, kv_prefix_len)
+            else:
+                num_computed_tokens = max(num_computed_tokens, shareable_tokens)
 
         return _PrefixSnapshot(
             num_computed_tokens=num_computed_tokens,

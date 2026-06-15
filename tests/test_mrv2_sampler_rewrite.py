@@ -316,6 +316,84 @@ def test_gpu_worker_rewrite_batches_same_prefix_groups() -> None:
     assert reset_prefix == 3
 
 
+def test_gpu_worker_rewrite_copies_partial_kv_block() -> None:
+    sampler = BeamSearchMRV2Sampler.__new__(BeamSearchMRV2Sampler)
+    sampler.base_sampler = SimpleNamespace(
+        req_states=SimpleNamespace(
+            all_token_ids=FakeTensor(
+                torch.zeros((2, 8), dtype=torch.int32, device=DEVICE)
+            ),
+            total_len=FakeTensor(torch.zeros(2, dtype=torch.int32, device=DEVICE)),
+            num_computed_tokens=FakeTensor(
+                torch.zeros(2, dtype=torch.int32, device=DEVICE)
+            ),
+        )
+    )
+    sampler.block_tables = SimpleNamespace(
+        block_sizes=[4],
+        block_tables=[
+            FakeTensor(
+                torch.tensor(
+                    [
+                        [10, 20, 0],
+                        [30, 40, 0],
+                    ],
+                    dtype=torch.int32,
+                    device=DEVICE,
+                )
+            )
+        ],
+    )
+    sampler.self_attn_group_indices = (0,)
+    sampler._pending_computed_resets = []
+    sampler.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["layer0"])]
+    )
+    kv_cache = torch.zeros((64, 2, 4, 1, 2), dtype=torch.float16, device=DEVICE)
+    kv_cache[20] = torch.arange(
+        kv_cache[20].numel(),
+        dtype=torch.float16,
+        device=DEVICE,
+    ).reshape_as(kv_cache[20])
+    sampler.kv_cache_forward_context = {
+        "layer0": SimpleNamespace(kv_cache=kv_cache),
+    }
+
+    req_idx_by_group = torch.tensor([[0, 1]], dtype=torch.long, device=DEVICE)
+    tokens = torch.tensor(
+        [[[1, 2, 3, 4, 5, 0], [1, 2, 3, 4, 6, 0]]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    transitions = _BeamTransitionsGpu(
+        gids=("gid",),
+        steps=(0,),
+        prefix_lens=(5,),
+        prompt_lens=(0,),
+        active_counts=(1,),
+        req_idx_by_group=req_idx_by_group,
+        dst_slots=torch.tensor([[1, 0]], dtype=torch.long, device=DEVICE),
+        src_slots=torch.tensor([[0, 0]], dtype=torch.long, device=DEVICE),
+        fork_src=torch.empty((1, 2), dtype=torch.long, device=DEVICE),
+        active_mask=torch.empty((1, 2), dtype=torch.bool, device=DEVICE),
+        tokens=tokens,
+        cum=torch.zeros((1, 2), dtype=torch.float32, device=DEVICE),
+    )
+
+    sampler._apply_gpu_worker_rewrites(transitions, req_idx_by_group)
+
+    assert sampler.block_tables.block_tables[0].gpu.cpu().tolist() == [
+        [10, 20, 0],
+        [10, 40, 0],
+    ]
+    assert torch.equal(kv_cache[40].cpu(), kv_cache[20].cpu())
+    assert sampler.base_sampler.req_states.total_len.gpu.cpu().tolist() == [0, 5]
+    assert sampler.base_sampler.req_states.num_computed_tokens.gpu.cpu().tolist() == [
+        0,
+        5,
+    ]
+
+
 def test_pending_computed_reset_restores_prefix_after_postprocess() -> None:
     sampler = _sampler()
     sampler._pending_computed_resets.append((

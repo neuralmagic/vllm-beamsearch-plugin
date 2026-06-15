@@ -485,6 +485,129 @@ def _rewrite_worker_block_prefix_kernel(
 
 
 @triton.jit
+def _partial_block_ids_kernel(
+    table,
+    req_idx_by_group,
+    src_slots,
+    dst_slots,
+    prefix_lens,
+    active_counts,
+    src_block_ids,
+    dst_block_ids,
+    block_size: tl.constexpr,
+    beam_width: tl.constexpr,
+    table_stride0,
+    table_stride1,
+    req_idx_stride0,
+    req_idx_stride1,
+    src_stride0,
+    src_stride1,
+    dst_stride0,
+    dst_stride1,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    out_idx = group * beam_width + row
+    tl.store(src_block_ids + out_idx, -1)
+    tl.store(dst_block_ids + out_idx, -1)
+
+    active_count = tl.load(active_counts + group)
+    prefix_len = tl.load(prefix_lens + group)
+    has_partial = prefix_len % block_size != 0
+    valid = (row < active_count) & has_partial
+    src_slot = tl.load(
+        src_slots + group * src_stride0 + row * src_stride1,
+        mask=valid,
+        other=-1,
+    )
+    dst_slot = tl.load(
+        dst_slots + group * dst_stride0 + row * dst_stride1,
+        mask=valid,
+        other=-1,
+    )
+    valid = valid & (src_slot != dst_slot)
+    src_req_idx = tl.load(
+        req_idx_by_group + group * req_idx_stride0 + src_slot * req_idx_stride1,
+        mask=valid,
+        other=-1,
+    )
+    dst_req_idx = tl.load(
+        req_idx_by_group + group * req_idx_stride0 + dst_slot * req_idx_stride1,
+        mask=valid,
+        other=-1,
+    )
+    partial_block = prefix_len // block_size
+    valid = valid & (src_req_idx >= 0) & (dst_req_idx >= 0)
+    src_block = tl.load(
+        table + src_req_idx * table_stride0 + partial_block * table_stride1,
+        mask=valid,
+        other=-1,
+    )
+    dst_block = tl.load(
+        table + dst_req_idx * table_stride0 + partial_block * table_stride1,
+        mask=valid,
+        other=-1,
+    )
+    valid = valid & (src_block >= 0) & (dst_block >= 0) & (src_block != dst_block)
+    tl.store(src_block_ids + out_idx, src_block, mask=valid)
+    tl.store(dst_block_ids + out_idx, dst_block, mask=valid)
+
+
+@triton.jit
+def _snapshot_kv_blocks_kernel(
+    cache_pages,
+    scratch,
+    src_block_ids,
+    page_elems: tl.constexpr,
+    cache_stride0,
+    scratch_stride0,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    pair = tl.program_id(0)
+    col_block = tl.program_id(1)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    src_block = tl.load(src_block_ids + pair)
+    mask = (src_block >= 0) & (offsets < page_elems)
+    values = tl.load(
+        cache_pages + src_block * cache_stride0 + offsets,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        scratch + pair * scratch_stride0 + offsets,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _rewrite_kv_blocks_kernel(
+    cache_pages,
+    scratch,
+    dst_block_ids,
+    page_elems: tl.constexpr,
+    cache_stride0,
+    scratch_stride0,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    pair = tl.program_id(0)
+    col_block = tl.program_id(1)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    dst_block = tl.load(dst_block_ids + pair)
+    mask = (dst_block >= 0) & (offsets < page_elems)
+    values = tl.load(
+        scratch + pair * scratch_stride0 + offsets,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        cache_pages + dst_block * cache_stride0 + offsets,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _beam_state_rewrite_kernel(
     token_prefix,
     token_pool,
@@ -610,6 +733,54 @@ def _copy_cpu_tensor_to_gpu(
     gpu = torch.empty(cpu.shape, dtype=cpu.dtype, device=device)
     gpu.copy_(cpu, non_blocking=True)
     return gpu
+
+
+def _kv_cache_pages(cache: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """View a KV cache as physical pages without changing storage order."""
+    page_elems = int(cache.stride(0))
+    return torch.as_strided(
+        cache,
+        size=(int(cache.shape[0]), page_elems),
+        stride=(page_elems, 1),
+    ), page_elems
+
+
+def _copy_kv_pages(
+    cache: torch.Tensor,
+    src_block_ids: torch.Tensor,
+    dst_block_ids: torch.Tensor,
+) -> None:
+    """Copy full KV pages through a temp buffer so swaps stay correct."""
+    cache_pages, page_elems = _kv_cache_pages(cache)
+    n_pairs = int(src_block_ids.numel())
+    if n_pairs == 0 or page_elems <= 0:
+        return
+
+    scratch = torch.empty(
+        (n_pairs, page_elems),
+        dtype=cache.dtype,
+        device=cache.device,
+    )
+    block_n = min(triton.next_power_of_2(page_elems), 1024)
+    grid = (n_pairs, triton.cdiv(page_elems, block_n))
+    _snapshot_kv_blocks_kernel[grid](
+        cache_pages,
+        scratch,
+        src_block_ids.reshape(-1),
+        page_elems,
+        cache_pages.stride(0),
+        scratch.stride(0),
+        BLOCK_N=block_n,
+    )
+    _rewrite_kv_blocks_kernel[grid](
+        cache_pages,
+        scratch,
+        dst_block_ids.reshape(-1),
+        page_elems,
+        cache_pages.stride(0),
+        scratch.stride(0),
+        BLOCK_N=block_n,
+    )
 
 
 def _cat_tensors(values: list[torch.Tensor]) -> torch.Tensor:
@@ -1014,6 +1185,8 @@ class BeamSearchMRV2Sampler:
         self.req_to_group: dict[str, tuple[str, int]] = {}
         self.block_tables: Any | None = None
         self.self_attn_group_indices: tuple[int, ...] = ()
+        self.kv_cache_config: Any | None = None
+        self.kv_cache_forward_context: dict[str, Any] | None = None
         self._pending_computed_resets: list[
             tuple[torch.Tensor, int | torch.Tensor]
         ] = []
@@ -1043,6 +1216,14 @@ class BeamSearchMRV2Sampler:
     ) -> None:
         self.block_tables = block_tables
         self.self_attn_group_indices = self_attn_group_indices
+
+    def set_kv_caches(
+        self,
+        kv_cache_config: Any,
+        forward_context: dict[str, Any],
+    ) -> None:
+        self.kv_cache_config = kv_cache_config
+        self.kv_cache_forward_context = forward_context
 
     def register_request(
         self,
@@ -1854,60 +2035,140 @@ class BeamSearchMRV2Sampler:
         for group_idx in self.self_attn_group_indices:
             block_size = int(self.block_tables.block_sizes[group_idx])
             max_prefix_blocks = max_prefix_len // block_size
-            if max_prefix_blocks <= 0:
-                continue
             table = self.block_tables.block_tables[group_idx].gpu
-            block_prefix = torch.empty(
-                (group_count, beam_width, max_prefix_blocks),
-                dtype=table.dtype,
-                device=table.device,
-            )
-            block_n = min(triton.next_power_of_2(max_prefix_blocks), 1024)
-            grid = (
-                group_count,
-                beam_width,
-                triton.cdiv(max_prefix_blocks, block_n),
-            )
-            _snapshot_worker_block_prefix_kernel[grid](
-                table,
-                block_prefix,
-                req_idx_by_group,
-                transitions.src_slots,
-                prefix_lens,
-                active_counts,
-                block_size,
-                beam_width,
-                table.stride(0),
-                table.stride(1),
-                block_prefix.stride(0),
-                block_prefix.stride(1),
-                block_prefix.stride(2),
-                req_idx_by_group.stride(0),
-                req_idx_by_group.stride(1),
-                transitions.src_slots.stride(0),
-                transitions.src_slots.stride(1),
-                BLOCK_N=block_n,
-            )
-            _rewrite_worker_block_prefix_kernel[grid](
-                table,
-                block_prefix,
-                req_idx_by_group,
-                transitions.dst_slots,
-                prefix_lens,
-                active_counts,
-                block_size,
-                beam_width,
-                table.stride(0),
-                table.stride(1),
-                block_prefix.stride(0),
-                block_prefix.stride(1),
-                block_prefix.stride(2),
-                req_idx_by_group.stride(0),
-                req_idx_by_group.stride(1),
-                transitions.dst_slots.stride(0),
-                transitions.dst_slots.stride(1),
-                BLOCK_N=block_n,
-            )
+            if max_prefix_blocks > 0:
+                block_prefix = torch.empty(
+                    (group_count, beam_width, max_prefix_blocks),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+                block_n = min(triton.next_power_of_2(max_prefix_blocks), 1024)
+                grid = (
+                    group_count,
+                    beam_width,
+                    triton.cdiv(max_prefix_blocks, block_n),
+                )
+                _snapshot_worker_block_prefix_kernel[grid](
+                    table,
+                    block_prefix,
+                    req_idx_by_group,
+                    transitions.src_slots,
+                    prefix_lens,
+                    active_counts,
+                    block_size,
+                    beam_width,
+                    table.stride(0),
+                    table.stride(1),
+                    block_prefix.stride(0),
+                    block_prefix.stride(1),
+                    block_prefix.stride(2),
+                    req_idx_by_group.stride(0),
+                    req_idx_by_group.stride(1),
+                    transitions.src_slots.stride(0),
+                    transitions.src_slots.stride(1),
+                    BLOCK_N=block_n,
+                )
+                _rewrite_worker_block_prefix_kernel[grid](
+                    table,
+                    block_prefix,
+                    req_idx_by_group,
+                    transitions.dst_slots,
+                    prefix_lens,
+                    active_counts,
+                    block_size,
+                    beam_width,
+                    table.stride(0),
+                    table.stride(1),
+                    block_prefix.stride(0),
+                    block_prefix.stride(1),
+                    block_prefix.stride(2),
+                    req_idx_by_group.stride(0),
+                    req_idx_by_group.stride(1),
+                    transitions.dst_slots.stride(0),
+                    transitions.dst_slots.stride(1),
+                    BLOCK_N=block_n,
+                )
+            if block_size > 1:
+                self._copy_partial_worker_kv_blocks(
+                    group_idx=group_idx,
+                    table=table,
+                    req_idx_by_group=req_idx_by_group,
+                    transitions=transitions,
+                    prefix_lens=prefix_lens,
+                    active_counts=active_counts,
+                    block_size=block_size,
+                    beam_width=beam_width,
+                )
+
+    def _copy_partial_worker_kv_blocks(
+        self,
+        *,
+        group_idx: int,
+        table: torch.Tensor,
+        req_idx_by_group: torch.Tensor,
+        transitions: _BeamTransitionsGpu,
+        prefix_lens: torch.Tensor,
+        active_counts: torch.Tensor,
+        block_size: int,
+        beam_width: int,
+    ) -> None:
+        """Copy source partial KV pages into destination-owned pages."""
+        if not any(length % block_size for length in transitions.prefix_lens):
+            return
+
+        group_count = len(transitions.gids)
+        src_block_ids = torch.empty(
+            (group_count, beam_width),
+            dtype=table.dtype,
+            device=table.device,
+        )
+        dst_block_ids = torch.empty_like(src_block_ids)
+        _partial_block_ids_kernel[(group_count, beam_width)](
+            table,
+            req_idx_by_group,
+            transitions.src_slots,
+            transitions.dst_slots,
+            prefix_lens,
+            active_counts,
+            src_block_ids,
+            dst_block_ids,
+            block_size,
+            beam_width,
+            table.stride(0),
+            table.stride(1),
+            req_idx_by_group.stride(0),
+            req_idx_by_group.stride(1),
+            transitions.src_slots.stride(0),
+            transitions.src_slots.stride(1),
+            transitions.dst_slots.stride(0),
+            transitions.dst_slots.stride(1),
+        )
+
+        for cache in self._self_attn_kv_caches(group_idx):
+            _copy_kv_pages(cache, src_block_ids, dst_block_ids)
+
+    def _self_attn_kv_caches(self, group_idx: int) -> list[torch.Tensor]:
+        kv_cache_config = self.kv_cache_config
+        forward_context = self.kv_cache_forward_context
+        if kv_cache_config is None or forward_context is None:
+            return []
+        if group_idx >= len(kv_cache_config.kv_cache_groups):
+            return []
+
+        caches: list[torch.Tensor] = []
+        seen: set[int] = set()
+        group = kv_cache_config.kv_cache_groups[group_idx]
+        for layer_name in group.layer_names:
+            attn_layer = forward_context.get(layer_name)
+            cache = getattr(attn_layer, "kv_cache", None)
+            if not isinstance(cache, torch.Tensor):
+                continue
+            key = cache.data_ptr()
+            if key in seen:
+                continue
+            seen.add(key)
+            caches.append(cache)
+        return caches
 
     def trace_gathered_block_tables(
         self,
