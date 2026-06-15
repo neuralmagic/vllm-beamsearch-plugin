@@ -11,7 +11,7 @@ from vllm_beam_search.mrv2_sampler import (
     AsyncBeamTransitions,
     BeamSearchMRV2Sampler,
     _BeamGroupStatePool,
-    _BeamTransitionGpuBatch,
+    _BeamTransitionsGpu,
     _TransitionBufferPool,
 )
 
@@ -333,7 +333,7 @@ def test_pending_computed_reset_restores_prefix_after_postprocess() -> None:
     assert sampler._pending_computed_resets == []
 
 
-def test_batched_select_masks_padded_inactive_beams() -> None:
+def test_select_masks_padded_inactive_beams() -> None:
     sampler = BeamSearchMRV2Sampler.__new__(BeamSearchMRV2Sampler)
     sampler.req_to_group = {
         "gid:beam:0": ("gid", 0),
@@ -388,7 +388,7 @@ def test_batched_select_masks_padded_inactive_beams() -> None:
     logits[1, 8] = 8.0
     sampled = torch.zeros(2, dtype=torch.int64, device=DEVICE)
 
-    transitions = sampler._gpu_select_groups_batched(
+    transitions = sampler._gpu_select_groups(
         processed_logits=logits,
         input_batch=SimpleNamespace(
             req_ids=["gid:beam:0", "gid:beam:2"],
@@ -415,7 +415,55 @@ def test_batched_select_masks_padded_inactive_beams() -> None:
     ]
 
 
-def test_batched_select_handles_mixed_lengths_in_one_bucket() -> None:
+def test_beam_view_reorders_interleaved_requests() -> None:
+    sampler = BeamSearchMRV2Sampler.__new__(BeamSearchMRV2Sampler)
+    sampler.req_to_group = {
+        "g0:beam:0": ("g0", 0),
+        "g0:beam:1": ("g0", 1),
+        "g1:beam:0": ("g1", 0),
+        "g1:beam:1": ("g1", 1),
+    }
+    sampler.groups = {
+        gid: BeamRuntime(
+            beam_width=2,
+            eos_token_id=None,
+            no_repeat_ngram_size=0,
+            prompt_tokens=[],
+            tokens=[[], []],
+            cum=[0.0, _INIT_NEG],
+            fork_src=[0, 1],
+            active=[True, True],
+        )
+        for gid in ("g0", "g1")
+    }
+
+    view = sampler._beam_view_by_group(
+        SimpleNamespace(
+            req_ids=[
+                "g0:beam:0",
+                "g1:beam:0",
+                "g0:beam:1",
+                "g1:beam:1",
+            ],
+            cu_num_logits_np=np.array([0, 1, 2, 3, 4], dtype=np.int32),
+            idx_mapping_np=np.array([10, 11, 12, 13], dtype=np.int32),
+        ),
+        num_logits=4,
+    )
+
+    assert view.gids == ("g0", "g1")
+    assert view.beam_indices_cpu.tolist() == [[0, 1], [0, 1]]
+    assert view.logit_indices_cpu.tolist() == [[0, 2], [1, 3]]
+    assert view.slot_to_batch_cpu.tolist() == [[0, 2], [1, 3]]
+    assert view.req_idx_cpu.tolist() == [[10, 12], [11, 13]]
+    assert view.valid_beam_mask_cpu.tolist() == [
+        [True, True],
+        [True, True],
+    ]
+    assert view.active_slot_counts == (2, 2)
+
+
+def test_select_handles_mixed_lengths_in_one_bucket() -> None:
     sampler = BeamSearchMRV2Sampler.__new__(BeamSearchMRV2Sampler)
     sampler.req_to_group = {
         "g0:beam:0": ("g0", 0),
@@ -486,7 +534,7 @@ def test_batched_select_handles_mixed_lengths_in_one_bucket() -> None:
     logits[2, 10] = 7.0
     sampled = torch.zeros(4, dtype=torch.int64, device=DEVICE)
 
-    transitions = sampler._gpu_select_groups_batched(
+    transitions = sampler._gpu_select_groups(
         processed_logits=logits,
         input_batch=SimpleNamespace(
             req_ids=[
@@ -518,7 +566,7 @@ def test_batched_select_handles_mixed_lengths_in_one_bucket() -> None:
     assert by_gid["g1"].tokens == ((7, 0, 9), (7, 0, 10))
 
 
-def test_batched_select_materializes_eos_completions_batched() -> None:
+def test_select_materializes_eos_completions() -> None:
     sampler = BeamSearchMRV2Sampler.__new__(BeamSearchMRV2Sampler)
     sampler.req_to_group = {
         "g0:beam:0": ("g0", 0),
@@ -580,7 +628,7 @@ def test_batched_select_materializes_eos_completions_batched() -> None:
     logits[2, 8] = 9.0
     sampled = torch.zeros(4, dtype=torch.int64, device=DEVICE)
 
-    transitions = sampler._gpu_select_groups_batched(
+    transitions = sampler._gpu_select_groups(
         processed_logits=logits,
         input_batch=SimpleNamespace(
             req_ids=[
@@ -619,7 +667,7 @@ def test_batched_select_materializes_eos_completions_batched() -> None:
 
 def test_async_beam_transitions_use_persistent_gpu_slot_buffer() -> None:
     pool = _TransitionBufferPool(num_slots=2)
-    batch = _BeamTransitionGpuBatch(
+    gpu_transitions = _BeamTransitionsGpu(
         gids=("g0", "g1"),
         steps=(3, 4),
         prefix_lens=(4, 4),
@@ -658,7 +706,7 @@ def test_async_beam_transitions_use_persistent_gpu_slot_buffer() -> None:
             device=DEVICE,
         ),
     )
-    transitions = AsyncBeamTransitions(batch, buffer_pool=pool)
+    transitions = AsyncBeamTransitions(gpu_transitions, buffer_pool=pool)
 
     staged = transitions.to_cpu_nonblocking()
     torch.cuda.synchronize()
@@ -677,7 +725,10 @@ def test_async_beam_transitions_use_persistent_gpu_slot_buffer() -> None:
     assert out[0].tokens == ((11, 12, 13), (21, 22, 23))
     assert out[1].tokens == ((31, 32, 33), (41, 42, 43))
 
-    staged_again = AsyncBeamTransitions(batch, buffer_pool=pool).to_cpu_nonblocking()
+    staged_again = AsyncBeamTransitions(
+        gpu_transitions,
+        buffer_pool=pool,
+    ).to_cpu_nonblocking()
     torch.cuda.synchronize()
     assert staged_again.tensors is not None
     token_buffers = [
