@@ -1,8 +1,7 @@
 """Beam-search data classes for the V1 plugin's in-flight scheduler.
 
-These live on the scheduler side. Per-step per-beam mutable state
-(cumulative scores, token sequences during generation) is owned by
-the BeamSearchLogitsProcessor — the scheduler only keeps group identity
+These live on the scheduler side. Per-step beam decisions arrive from the
+MRV2 sampler as BeamTransition records; the scheduler keeps group identity
 and completed-beam records.
 """
 from __future__ import annotations

@@ -16,3 +16,6 @@ dependencies = [
 dev = [
     "pytest",
 ]
+
+[project.entry-points."vllm.general_plugins"]
+beam_search = "vllm_beam_search:register_beam_search_plugin"

@@ -1,0 +1,2041 @@
+"""MRV2 sampler wrapper for in-flight beam search."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from contextlib import contextmanager
+from dataclasses import dataclass
+import os
+from typing import Any
+
+import torch
+import triton
+import triton.language as tl
+
+from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+from .beam_types import _INIT_NEG, BeamRuntime, BeamTransition
+
+BEAM_TRANSITIONS_OUTPUT = "vllm_beam_search.transitions"
+_SYNC_CHECK = os.getenv("VLLM_BEAM_GPU_SYNC_CHECK")
+_BLOCK_TRACE = bool(int(os.getenv("VLLM_BEAM_BLOCK_TRACE", "0")))
+_BLOCK_TRACE_STEPS = int(os.getenv("VLLM_BEAM_BLOCK_TRACE_STEPS", "24"))
+_BLOCK_TRACE_WIDTH = int(os.getenv("VLLM_BEAM_BLOCK_TRACE_WIDTH", "12"))
+_NEG_INF = float("-inf")
+_SelectEntry = tuple[str, BeamRuntime, dict[str, Any], list[tuple[int, int]]]
+_SelectKey = tuple[int, int, int | None]
+
+
+@dataclass
+class BeamSamplerOutput(SamplerOutput):
+    async_outputs: dict[str, Any] | None = None
+
+
+@triton.jit
+def _copy_prefix_rows_kernel(
+    src,
+    dst,
+    src_rows,
+    dst_rows,
+    n_cols: tl.constexpr,
+    src_stride0,
+    src_stride1,
+    dst_stride0,
+    dst_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    row_idx = tl.program_id(0)
+    col_block = tl.program_id(1)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < n_cols
+
+    src_row = tl.load(src_rows + row_idx)
+    dst_row = tl.load(dst_rows + row_idx)
+    values = tl.load(
+        src + src_row * src_stride0 + offsets * src_stride1,
+        mask=mask,
+    )
+    tl.store(
+        dst + dst_row * dst_stride0 + offsets * dst_stride1,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _batched_no_repeat_ngram_mask_kernel(
+    tokens,
+    logprobs,
+    present_slots,
+    state_slots,
+    lengths,
+    ngram: tl.constexpr,
+    beam_width: tl.constexpr,
+    token_stride0,
+    token_stride1,
+    token_stride2,
+    logprobs_stride0,
+    logprobs_stride1,
+    logprobs_stride2,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    start = tl.program_id(2)
+    slot = tl.load(present_slots + group * beam_width + row)
+    state_slot = tl.load(state_slots + group)
+    group_length = tl.load(lengths + group)
+    valid_start = start < group_length - (ngram - 1)
+
+    match = valid_start
+    for offset in tl.static_range(0, ngram - 1):
+        prev = tl.load(
+            tokens
+            + state_slot * token_stride0
+            + slot * token_stride1
+            + (start + offset) * token_stride2,
+            mask=valid_start,
+            other=0,
+        )
+        suffix = tl.load(
+            tokens
+            + state_slot * token_stride0
+            + slot * token_stride1
+            + (group_length - (ngram - 1) + offset) * token_stride2,
+            mask=valid_start,
+            other=0,
+        )
+        match = match & (prev == suffix)
+
+    banned = tl.load(
+        tokens
+        + state_slot * token_stride0
+        + slot * token_stride1
+        + (start + ngram - 1) * token_stride2,
+        mask=valid_start,
+        other=0,
+    )
+    tl.store(
+        logprobs
+        + group * logprobs_stride0
+        + row * logprobs_stride1
+        + banned * logprobs_stride2,
+        -float("inf"),
+        mask=match & valid_start,
+    )
+
+
+@triton.jit
+def _snapshot_beam_prefix_kernel(
+    token_pool,
+    token_prefix,
+    src_slots,
+    state_slots,
+    lengths,
+    beam_width: tl.constexpr,
+    pool_stride0,
+    pool_stride1,
+    pool_stride2,
+    prefix_stride0,
+    prefix_stride1,
+    prefix_stride2,
+    src_stride0,
+    src_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    state_slot = tl.load(state_slots + group)
+    length = tl.load(lengths + group)
+    src_slot = tl.load(src_slots + group * src_stride0 + row * src_stride1)
+
+    prefix_mask = offsets < length
+    prefix_vals = tl.load(
+        token_pool
+        + state_slot * pool_stride0
+        + src_slot * pool_stride1
+        + offsets * pool_stride2,
+        mask=prefix_mask,
+        other=0,
+    )
+    tl.store(
+        token_prefix
+        + group * prefix_stride0
+        + row * prefix_stride1
+        + offsets * prefix_stride2,
+        prefix_vals,
+        mask=prefix_mask,
+    )
+
+
+@triton.jit
+def _init_beam_transition_kernel(
+    fork_src,
+    active_mask,
+    beam_width: tl.constexpr,
+    fork_stride0,
+    fork_stride1,
+    active_stride0,
+    active_stride1,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    tl.store(fork_src + group * fork_stride0 + row * fork_stride1, row)
+    tl.store(active_mask + group * active_stride0 + row * active_stride1, False)
+
+
+@triton.jit
+def _snapshot_transition_state_kernel(
+    token_pool,
+    cum_pool,
+    tokens_out,
+    cum_out,
+    state_slots,
+    lengths,
+    beam_width: tl.constexpr,
+    pool_stride0,
+    pool_stride1,
+    pool_stride2,
+    cum_pool_stride0,
+    cum_pool_stride1,
+    out_stride0,
+    out_stride1,
+    out_stride2,
+    cum_out_stride0,
+    cum_out_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    state_slot = tl.load(state_slots + group)
+    length = tl.load(lengths + group) + 1
+    mask = offsets < length
+    values = tl.load(
+        token_pool
+        + state_slot * pool_stride0
+        + row * pool_stride1
+        + offsets * pool_stride2,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        tokens_out
+        + group * out_stride0
+        + row * out_stride1
+        + offsets * out_stride2,
+        values,
+        mask=mask,
+    )
+    if col_block == 0:
+        score = tl.load(
+            cum_pool + state_slot * cum_pool_stride0 + row * cum_pool_stride1
+        )
+        tl.store(
+            cum_out + group * cum_out_stride0 + row * cum_out_stride1,
+            score,
+        )
+
+
+@triton.jit
+def _set_num_computed_kernel(
+    num_computed,
+    req_indices,
+    prefix_lens,
+    n_items,
+    req_stride0,
+    lens_stride0,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    block = tl.program_id(0)
+    offsets = block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < n_items
+    req_idx = tl.load(req_indices + offsets * req_stride0, mask=mask, other=-1)
+    prefix_len = tl.load(prefix_lens + offsets * lens_stride0, mask=mask, other=0)
+    tl.store(num_computed + req_idx, prefix_len, mask=mask & (req_idx >= 0))
+
+
+@triton.jit
+def _rewrite_worker_tokens_kernel(
+    transition_tokens,
+    req_tokens,
+    total_len,
+    num_computed,
+    req_idx_by_group,
+    dst_slots,
+    prefix_lens,
+    active_counts,
+    pending_req_idx,
+    pending_prefix_lens,
+    beam_width: tl.constexpr,
+    trans_stride0,
+    trans_stride1,
+    trans_stride2,
+    req_token_stride0,
+    req_token_stride1,
+    req_idx_stride0,
+    req_idx_stride1,
+    dst_stride0,
+    dst_stride1,
+    pending_stride0,
+    pending_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    active_count = tl.load(active_counts + group)
+    valid = row < active_count
+    dst_slot = tl.load(dst_slots + group * dst_stride0 + row * dst_stride1)
+    req_idx = tl.load(
+        req_idx_by_group + group * req_idx_stride0 + dst_slot * req_idx_stride1,
+        mask=valid,
+        other=-1,
+    )
+    prefix_len = tl.load(prefix_lens + group)
+    mask = valid & (req_idx >= 0) & (offsets < prefix_len)
+    values = tl.load(
+        transition_tokens
+        + group * trans_stride0
+        + dst_slot * trans_stride1
+        + offsets * trans_stride2,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        req_tokens + req_idx * req_token_stride0 + offsets * req_token_stride1,
+        values,
+        mask=mask,
+    )
+    if col_block == 0:
+        tl.store(total_len + req_idx, prefix_len, mask=valid & (req_idx >= 0))
+        tl.store(num_computed + req_idx, prefix_len, mask=valid & (req_idx >= 0))
+        tl.store(
+            pending_req_idx + group * pending_stride0 + row * pending_stride1,
+            req_idx,
+        )
+        tl.store(
+            pending_prefix_lens + group * pending_stride0 + row * pending_stride1,
+            prefix_len,
+        )
+
+
+@triton.jit
+def _snapshot_worker_block_prefix_kernel(
+    table,
+    block_prefix,
+    req_idx_by_group,
+    src_slots,
+    prefix_lens,
+    active_counts,
+    block_size: tl.constexpr,
+    beam_width: tl.constexpr,
+    table_stride0,
+    table_stride1,
+    prefix_stride0,
+    prefix_stride1,
+    prefix_stride2,
+    req_idx_stride0,
+    req_idx_stride1,
+    src_stride0,
+    src_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    active_count = tl.load(active_counts + group)
+    valid = row < active_count
+    src_slot = tl.load(src_slots + group * src_stride0 + row * src_stride1)
+    req_idx = tl.load(
+        req_idx_by_group + group * req_idx_stride0 + src_slot * req_idx_stride1,
+        mask=valid,
+        other=-1,
+    )
+    prefix_blocks = tl.load(prefix_lens + group) // block_size
+    mask = valid & (req_idx >= 0) & (offsets < prefix_blocks)
+    values = tl.load(
+        table + req_idx * table_stride0 + offsets * table_stride1,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        block_prefix
+        + group * prefix_stride0
+        + row * prefix_stride1
+        + offsets * prefix_stride2,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _rewrite_worker_block_prefix_kernel(
+    table,
+    block_prefix,
+    req_idx_by_group,
+    dst_slots,
+    prefix_lens,
+    active_counts,
+    block_size: tl.constexpr,
+    beam_width: tl.constexpr,
+    table_stride0,
+    table_stride1,
+    prefix_stride0,
+    prefix_stride1,
+    prefix_stride2,
+    req_idx_stride0,
+    req_idx_stride1,
+    dst_stride0,
+    dst_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    active_count = tl.load(active_counts + group)
+    valid = row < active_count
+    dst_slot = tl.load(dst_slots + group * dst_stride0 + row * dst_stride1)
+    req_idx = tl.load(
+        req_idx_by_group + group * req_idx_stride0 + dst_slot * req_idx_stride1,
+        mask=valid,
+        other=-1,
+    )
+    prefix_blocks = tl.load(prefix_lens + group) // block_size
+    mask = valid & (req_idx >= 0) & (offsets < prefix_blocks)
+    values = tl.load(
+        block_prefix
+        + group * prefix_stride0
+        + row * prefix_stride1
+        + offsets * prefix_stride2,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        table + req_idx * table_stride0 + offsets * table_stride1,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _batched_beam_state_rewrite_kernel(
+    token_prefix,
+    token_pool,
+    cum_pool,
+    sampled,
+    slot_to_batch,
+    dst_slots,
+    src_slots,
+    selected_tokens,
+    selected_scores,
+    fork_src,
+    active_mask,
+    state_slots,
+    lengths,
+    present_mask,
+    beam_width: tl.constexpr,
+    prefix_stride0,
+    prefix_stride1,
+    prefix_stride2,
+    pool_stride0,
+    pool_stride1,
+    pool_stride2,
+    cum_stride0,
+    cum_stride1,
+    slot_batch_stride0,
+    slot_batch_stride1,
+    dst_stride0,
+    dst_stride1,
+    src_stride0,
+    src_stride1,
+    token_stride0,
+    token_stride1,
+    score_stride0,
+    score_stride1,
+    fork_stride0,
+    fork_stride1,
+    active_stride0,
+    active_stride1,
+    mask_stride0,
+    mask_stride1,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    col_block = tl.program_id(2)
+    offsets = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid = tl.load(present_mask + group * mask_stride0 + row * mask_stride1)
+    state_slot = tl.load(state_slots + group)
+    length = tl.load(lengths + group)
+    dst_slot = tl.load(dst_slots + group * dst_stride0 + row * dst_stride1)
+    src_slot = tl.load(src_slots + group * src_stride0 + row * src_stride1)
+    token = tl.load(
+        selected_tokens + group * token_stride0 + row * token_stride1
+    )
+
+    prefix_mask = offsets < length
+    prefix_vals = tl.load(
+        token_prefix
+        + group * prefix_stride0
+        + row * prefix_stride1
+        + offsets * prefix_stride2,
+        mask=valid & prefix_mask,
+        other=0,
+    )
+    tl.store(
+        token_pool
+        + state_slot * pool_stride0
+        + dst_slot * pool_stride1
+        + offsets * pool_stride2,
+        prefix_vals,
+        mask=valid & prefix_mask,
+    )
+    tl.store(
+        token_pool
+        + state_slot * pool_stride0
+        + dst_slot * pool_stride1
+        + length * pool_stride2,
+        token,
+        mask=valid & (col_block == 0),
+    )
+
+    if col_block == 0:
+        score = tl.load(
+            selected_scores + group * score_stride0 + row * score_stride1
+        )
+        tl.store(
+            cum_pool + state_slot * cum_stride0 + dst_slot * cum_stride1,
+            score,
+            mask=valid,
+        )
+        batch_row = tl.load(
+            slot_to_batch
+            + group * slot_batch_stride0
+            + dst_slot * slot_batch_stride1
+        )
+        tl.store(sampled + batch_row, token, mask=valid & (batch_row >= 0))
+        tl.store(
+            fork_src + group * fork_stride0 + dst_slot * fork_stride1,
+            src_slot,
+            mask=valid,
+        )
+        tl.store(
+            active_mask + group * active_stride0 + dst_slot * active_stride1,
+            True,
+            mask=valid,
+        )
+
+
+def _copy_prefix_rows(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    n_cols: int,
+) -> None:
+    """Copy row prefixes on GPU without materializing block IDs on CPU."""
+    if n_cols <= 0 or dst_rows.numel() == 0:
+        return
+
+    block_n = min(triton.next_power_of_2(n_cols), 1024)
+    grid = (dst_rows.numel(), triton.cdiv(n_cols, block_n))
+    _copy_prefix_rows_kernel[grid](
+        src,
+        dst,
+        src_rows,
+        dst_rows,
+        n_cols,
+        src.stride(0),
+        src.stride(1),
+        dst.stride(0),
+        dst.stride(1),
+        BLOCK_N=block_n,
+    )
+
+
+def _copy_cpu_values_to_gpu(
+    values: Any,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Stage small CPU metadata lists onto GPU without sync-debug trips."""
+    cpu = torch.tensor(values, dtype=dtype, pin_memory=True)
+    gpu = torch.empty(cpu.shape, dtype=dtype, device=device)
+    gpu.copy_(cpu, non_blocking=True)
+    return gpu
+
+
+def _cat_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+    """Return the lone tensor or concatenate a non-empty tensor list."""
+    assert values
+    if len(values) == 1:
+        return values[0]
+    return torch.cat(values)
+
+
+class _BeamGroupStatePool:
+    """Contiguous per-group beam state for batched sampler rewrites."""
+
+    def __init__(
+        self,
+        *,
+        beam_width: int,
+        max_len: int,
+        device: torch.device,
+        capacity: int | None = None,
+    ) -> None:
+        if capacity is None:
+            capacity = int(os.getenv("VLLM_BEAM_GROUP_STATE_CAPACITY", "2048"))
+        self.beam_width = beam_width
+        self.max_len = max_len
+        self.capacity = max(1, capacity)
+        self.tokens = torch.empty(
+            (self.capacity, beam_width, max_len),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.cum = torch.empty(
+            (self.capacity, beam_width),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.active = torch.empty(
+            (self.capacity, beam_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._next_slot = 0
+        self._free_slots: list[int] = []
+
+    def allocate(self) -> int:
+        if self._free_slots:
+            return self._free_slots.pop()
+        if self._next_slot >= self.capacity:
+            raise RuntimeError(
+                "Beam group state capacity exceeded; increase "
+                "VLLM_BEAM_GROUP_STATE_CAPACITY"
+            )
+        slot = self._next_slot
+        self._next_slot += 1
+        return slot
+
+    def release(self, slot: int) -> None:
+        self._free_slots.append(slot)
+
+    def initialize(self, slot: int, prompt_tokens: list[int]) -> int:
+        self.tokens[slot].zero_()
+        prompt = torch.as_tensor(
+            prompt_tokens,
+            dtype=self.tokens.dtype,
+            device=self.tokens.device,
+        )
+        prompt_len = int(prompt.numel())
+        if prompt_len:
+            self.tokens[slot, :, :prompt_len] = prompt.unsqueeze(0)
+        self.cum[slot].fill_(_INIT_NEG)
+        self.cum[slot, 0:1].fill_(0.0)
+        self.active[slot].fill_(True)
+        return prompt_len
+
+
+@dataclass
+class _BeamTransitionGpuBatch:
+    """Batched GPU transition state for worker rewrite and async output."""
+
+    gids: tuple[str, ...]
+    steps: tuple[int, ...]
+    prefix_lens: tuple[int, ...]
+    prompt_lens: tuple[int, ...]
+    active_counts: tuple[int, ...]
+    dst_slots: torch.Tensor
+    src_slots: torch.Tensor
+    fork_src: torch.Tensor
+    active_mask: torch.Tensor
+    tokens: torch.Tensor
+    cum: torch.Tensor
+    completion_scores: torch.Tensor | None = None
+    completion_sequences: torch.Tensor | None = None
+    completion_lens: tuple[int, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.gids)
+
+    def __iter__(self) -> Iterable[str]:
+        return iter(self.gids)
+
+    def __getitem__(self, gid: str) -> dict[str, Any]:
+        return self._transition_view(self.gids.index(gid))
+
+    def items(self) -> Iterable[tuple[str, dict[str, Any]]]:
+        for group_idx, gid in enumerate(self.gids):
+            yield gid, self._transition_view(group_idx)
+
+    def _transition_view(self, group_idx: int) -> dict[str, Any]:
+        active_count = self.active_counts[group_idx]
+        completion_sequences = self.completion_sequences
+        if completion_sequences is not None and self.completion_lens:
+            completion_sequences = completion_sequences[
+                group_idx,
+                :,
+                : self.completion_lens[group_idx],
+            ]
+        elif completion_sequences is not None:
+            completion_sequences = completion_sequences[group_idx]
+
+        completion_scores = self.completion_scores
+        if completion_scores is not None:
+            completion_scores = completion_scores[group_idx]
+
+        return {
+            "gid": self.gids[group_idx],
+            "step": self.steps[group_idx],
+            "prefix_len": self.prefix_lens[group_idx],
+            "prompt_len": self.prompt_lens[group_idx],
+            "dst_slots": self.dst_slots[group_idx, :active_count],
+            "src_slots": self.src_slots[group_idx, :active_count],
+            "fork_src": self.fork_src[group_idx],
+            "active_mask": self.active_mask[group_idx],
+            "tokens": self.tokens[group_idx],
+            "cum": self.cum[group_idx],
+            "completion_scores": completion_scores,
+            "completion_sequences": completion_sequences,
+        }
+
+    def async_tensors(self) -> dict[str, torch.Tensor | None]:
+        """Return only tensors needed by scheduler finalization."""
+        return {
+            "fork_src": self.fork_src,
+            "active_mask": self.active_mask,
+            "tokens": self.tokens,
+            "cum": self.cum,
+            "completion_scores": self.completion_scores,
+            "completion_sequences": self.completion_sequences,
+        }
+
+
+def _rewrite_beam_states_batched(
+    *,
+    entries: list[tuple[str, BeamRuntime, dict[str, Any], list[tuple[int, int]]]],
+    pool: _BeamGroupStatePool,
+    state_slots_by_group: torch.Tensor,
+    lengths_cpu: list[int],
+    sampled: torch.Tensor,
+    slot_to_batch: torch.Tensor,
+    present_mask: torch.Tensor,
+    dst_slots_by_group: torch.Tensor,
+    src_slots_by_group: torch.Tensor,
+    selected_tokens_by_group: torch.Tensor,
+    selected_scores_by_group: torch.Tensor,
+    beam_width: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Rewrite shared-pool beam state with fixed sampler launch count."""
+    device = sampled.device
+    group_count = len(entries)
+    max_length = max(lengths_cpu)
+    lengths = _copy_cpu_values_to_gpu(
+        lengths_cpu,
+        dtype=torch.long,
+        device=device,
+    )
+    token_prefix = torch.empty(
+        (group_count, beam_width, max_length),
+        dtype=pool.tokens.dtype,
+        device=device,
+    )
+    fork_src = torch.empty(
+        (group_count, beam_width),
+        dtype=torch.long,
+        device=device,
+    )
+    active_mask = torch.empty(
+        (group_count, beam_width),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    block_n = min(triton.next_power_of_2(max(max_length, 1)), 1024)
+    prefix_grid = (group_count, beam_width, triton.cdiv(max_length, block_n))
+    _snapshot_beam_prefix_kernel[prefix_grid](
+        pool.tokens,
+        token_prefix,
+        src_slots_by_group,
+        state_slots_by_group,
+        lengths,
+        beam_width,
+        pool.tokens.stride(0),
+        pool.tokens.stride(1),
+        pool.tokens.stride(2),
+        token_prefix.stride(0),
+        token_prefix.stride(1),
+        token_prefix.stride(2),
+        src_slots_by_group.stride(0),
+        src_slots_by_group.stride(1),
+        BLOCK_N=block_n,
+    )
+
+    init_grid = (group_count, beam_width)
+    _init_beam_transition_kernel[init_grid](
+        fork_src,
+        active_mask,
+        beam_width,
+        fork_src.stride(0),
+        fork_src.stride(1),
+        active_mask.stride(0),
+        active_mask.stride(1),
+    )
+
+    n_cols = max_length + 1
+    block_n = min(triton.next_power_of_2(n_cols), 1024)
+    rewrite_grid = (group_count, beam_width, triton.cdiv(n_cols, block_n))
+    selected_tokens = selected_tokens_by_group.to(torch.int64)
+    _batched_beam_state_rewrite_kernel[rewrite_grid](
+        token_prefix,
+        pool.tokens,
+        pool.cum,
+        sampled,
+        slot_to_batch,
+        dst_slots_by_group,
+        src_slots_by_group,
+        selected_tokens,
+        selected_scores_by_group,
+        fork_src,
+        active_mask,
+        state_slots_by_group,
+        lengths,
+        present_mask,
+        beam_width,
+        token_prefix.stride(0),
+        token_prefix.stride(1),
+        token_prefix.stride(2),
+        pool.tokens.stride(0),
+        pool.tokens.stride(1),
+        pool.tokens.stride(2),
+        pool.cum.stride(0),
+        pool.cum.stride(1),
+        slot_to_batch.stride(0),
+        slot_to_batch.stride(1),
+        dst_slots_by_group.stride(0),
+        dst_slots_by_group.stride(1),
+        src_slots_by_group.stride(0),
+        src_slots_by_group.stride(1),
+        selected_tokens.stride(0),
+        selected_tokens.stride(1),
+        selected_scores_by_group.stride(0),
+        selected_scores_by_group.stride(1),
+        fork_src.stride(0),
+        fork_src.stride(1),
+        active_mask.stride(0),
+        active_mask.stride(1),
+        present_mask.stride(0),
+        present_mask.stride(1),
+        BLOCK_N=block_n,
+    )
+    return fork_src, active_mask
+
+
+def _snapshot_transition_state_batched(
+    *,
+    pool: _BeamGroupStatePool,
+    state_slots_by_group: torch.Tensor,
+    lengths: torch.Tensor,
+    max_length: int,
+    beam_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Snapshot rewritten group state for async CPU finalization."""
+    group_count = state_slots_by_group.shape[0]
+    tokens = torch.empty(
+        (group_count, beam_width, max_length + 1),
+        dtype=pool.tokens.dtype,
+        device=pool.tokens.device,
+    )
+    cum = torch.empty(
+        (group_count, beam_width),
+        dtype=pool.cum.dtype,
+        device=pool.cum.device,
+    )
+    block_n = min(triton.next_power_of_2(max_length + 1), 1024)
+    grid = (group_count, beam_width, triton.cdiv(max_length + 1, block_n))
+    _snapshot_transition_state_kernel[grid](
+        pool.tokens,
+        pool.cum,
+        tokens,
+        cum,
+        state_slots_by_group,
+        lengths,
+        beam_width,
+        pool.tokens.stride(0),
+        pool.tokens.stride(1),
+        pool.tokens.stride(2),
+        pool.cum.stride(0),
+        pool.cum.stride(1),
+        tokens.stride(0),
+        tokens.stride(1),
+        tokens.stride(2),
+        cum.stride(0),
+        cum.stride(1),
+        BLOCK_N=block_n,
+    )
+    return tokens, cum
+
+
+def _build_completion_tensors_batched(
+    *,
+    entries: list[_SelectEntry],
+    pool: _BeamGroupStatePool,
+    state_slots_by_group: torch.Tensor,
+    lengths_cpu: list[int],
+    prompt_lens_cpu: list[int],
+    completion_slots: torch.Tensor | None,
+    completion_tokens: torch.Tensor | None,
+    completion_scores: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple[int, ...]]:
+    """Materialize EOS candidate sequences without per-group copy kernels."""
+    group_count = len(entries)
+    completion_lens = tuple(
+        length - prompt_len + 1
+        for length, prompt_len in zip(lengths_cpu, prompt_lens_cpu)
+    )
+    if (
+        completion_slots is None
+        or completion_tokens is None
+        or completion_scores is None
+    ):
+        return None, None, completion_lens
+
+    device = completion_slots.device
+    max_completion_len = max(completion_lens)
+    sequences = torch.zeros(
+        (
+            group_count,
+            completion_tokens.shape[1],
+            max_completion_len,
+        ),
+        dtype=pool.tokens.dtype,
+        device=device,
+    )
+    groups_by_shape: dict[tuple[int, int], list[int]] = {}
+    for group_idx, (length, prompt_len) in enumerate(
+        zip(lengths_cpu, prompt_lens_cpu)
+    ):
+        groups_by_shape.setdefault((length, prompt_len), []).append(group_idx)
+
+    for (length, prompt_len), group_indices_cpu in groups_by_shape.items():
+        group_indices = _copy_cpu_values_to_gpu(
+            group_indices_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+        state_slots = state_slots_by_group[group_indices]
+        slots = completion_slots[group_indices]
+        tokens = completion_tokens[group_indices].to(pool.tokens.dtype)
+        generated_len = length - prompt_len
+        completion_len = generated_len + 1
+        if generated_len > 0:
+            cols = torch.arange(
+                prompt_len,
+                length,
+                dtype=torch.long,
+                device=device,
+            )
+            prefix = pool.tokens[
+                state_slots[:, None, None],
+                slots[:, :, None],
+                cols[None, None, :],
+            ]
+            local_sequences = torch.cat((prefix, tokens.unsqueeze(-1)), dim=2)
+        else:
+            local_sequences = tokens.unsqueeze(-1)
+        sequences[group_indices, :, :completion_len] = local_sequences
+
+    return sequences, completion_scores, completion_lens
+
+
+@contextmanager
+def _gpu_sync_check():
+    if _SYNC_CHECK not in {"warn", "error"} or not torch.cuda.is_available():
+        yield
+        return
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode(_SYNC_CHECK)
+    try:
+        yield
+    except RuntimeError as exc:
+        if str(exc) == "called a synchronizing CUDA operation":
+            raise RuntimeError(
+                "GPU<->CPU sync detected in beam MRV2 sampler"
+            ) from exc
+        raise
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+
+class BeamSearchMRV2Sampler:
+    """Beam-aware wrapper around MRV2's GPU sampler."""
+
+    def __init__(
+        self,
+        base_sampler: Any,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        pin_memory: bool = False,
+    ) -> None:
+        self.base_sampler = base_sampler
+        self.groups: dict[str, BeamRuntime] = {}
+        self.req_to_group: dict[str, tuple[str, int]] = {}
+        self.block_tables: Any | None = None
+        self.self_attn_group_indices: tuple[int, ...] = ()
+        self._pending_computed_resets: list[
+            tuple[torch.Tensor, int | torch.Tensor]
+        ] = []
+        self._gpu_group_state: dict[str, dict[str, Any]] = {}
+        self._gpu_state_pools: dict[int, _BeamGroupStatePool] = {}
+        self._transition_buffer_pool = _TransitionBufferPool()
+        self._block_gather_trace_count = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_sampler, name)
+
+    def add_request(
+        self,
+        req_idx: int,
+        prompt_len: int,
+        sampling_params: SamplingParams,
+    ) -> None:
+        self.base_sampler.add_request(req_idx, prompt_len, sampling_params)
+
+    def apply_staged_writes(self) -> None:
+        self.base_sampler.apply_staged_writes()
+
+    def set_block_tables(
+        self,
+        block_tables: Any,
+        self_attn_group_indices: tuple[int, ...],
+    ) -> None:
+        self.block_tables = block_tables
+        self.self_attn_group_indices = self_attn_group_indices
+
+    def register_request(
+        self,
+        req_id: str,
+        sampling_params: SamplingParams | None,
+        prompt_token_ids: list[int] | None,
+    ) -> None:
+        if sampling_params is None:
+            return
+        extra = sampling_params.extra_args or {}
+        gid = extra.get("_beam_group_id")
+        if gid is None:
+            return
+
+        beam_idx = int(extra["_beam_index"])
+        beam_width = int(extra["_beam_width"])
+        eos = extra.get("_beam_eos_token_id")
+        no_repeat = int(extra.get("no_repeat_ngram_size", 0))
+
+        gr = self.groups.get(gid)
+        if gr is None:
+            gr = BeamRuntime(
+                beam_width=beam_width,
+                eos_token_id=int(eos) if eos is not None else None,
+                no_repeat_ngram_size=no_repeat,
+                prompt_tokens=list(prompt_token_ids or []),
+                tokens=[[] for _ in range(beam_width)],
+                cum=[_INIT_NEG] * beam_width,
+                fork_src=list(range(beam_width)),
+                active=[True] * beam_width,
+            )
+            gr.cum[0] = 0.0
+            self.groups[gid] = gr
+            self._init_gpu_group_state(gid, gr)
+
+        self.req_to_group[req_id] = (gid, beam_idx)
+
+    def _init_gpu_group_state(self, gid: str, gr: BeamRuntime) -> None:
+        if gid in self._gpu_group_state:
+            return
+        pool = self._get_gpu_state_pool(gr.beam_width)
+        slot = pool.allocate()
+        prompt_len = pool.initialize(slot, gr.prompt_tokens)
+        self._gpu_group_state[gid] = {
+            "tokens": pool.tokens[slot],
+            "length": prompt_len,
+            "prompt_len": prompt_len,
+            "cum": pool.cum[slot],
+            "active": pool.active[slot],
+            "pool": pool,
+            "slot": slot,
+            "step": 0,
+        }
+
+    def _get_gpu_state_pool(self, beam_width: int) -> _BeamGroupStatePool:
+        pool = self._gpu_state_pools.get(beam_width)
+        if pool is not None:
+            return pool
+        pool = _BeamGroupStatePool(
+            beam_width=beam_width,
+            max_len=int(self.base_sampler.req_states.max_model_len),
+            device=self.base_sampler.req_states.all_token_ids.gpu.device,
+        )
+        self._gpu_state_pools[beam_width] = pool
+        return pool
+
+    def remove_request(self, req_id: str) -> None:
+        entry = self.req_to_group.pop(req_id, None)
+        if entry is None:
+            return
+        gid, _beam_idx = entry
+        gr = self.groups.get(gid)
+        if gr is None:
+            return
+        if not any(group_id == gid for group_id, _ in self.req_to_group.values()):
+            self.groups.pop(gid, None)
+            state = self._gpu_group_state.pop(gid, None)
+            if state is not None:
+                state["pool"].release(int(state["slot"]))
+
+    def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
+        if not self._has_beam_rows(input_batch):
+            return self.base_sampler(logits, input_batch)
+
+        with _gpu_sync_check():
+            return self._sample_with_beam_logits(logits, input_batch)
+
+    def _has_beam_rows(self, input_batch: InputBatch) -> bool:
+        return any(req_id in self.req_to_group for req_id in input_batch.req_ids)
+
+    @staticmethod
+    def _request_will_sample(input_batch: InputBatch, batch_idx: int) -> bool:
+        """Return whether this request has a logits row in the current batch."""
+        return (
+            int(input_batch.cu_num_logits_np[batch_idx + 1])
+            > int(input_batch.cu_num_logits_np[batch_idx])
+        )
+
+    def _sample_with_beam_logits(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        sampler = self.base_sampler
+        expanded_idx_mapping = input_batch.expanded_idx_mapping
+        idx_mapping_np = input_batch.idx_mapping_np
+        expanded_local_pos = input_batch.expanded_local_pos
+        pos = input_batch.positions[input_batch.logits_indices]
+        input_ids = input_batch.input_ids[input_batch.logits_indices]
+
+        num_nans = get_num_nans(logits) if sampler.compute_nans else None
+
+        processed_logits = sampler.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            skip_top_k_top_p=True,
+        )
+
+        return self._sample_with_gpu_beam_select(
+            processed_logits,
+            input_batch,
+            num_nans,
+        )
+
+    def _sample_with_gpu_beam_select(
+        self,
+        processed_logits: torch.Tensor,
+        input_batch: InputBatch,
+        num_nans: torch.Tensor | None,
+    ) -> SamplerOutput:
+        sampled = torch.zeros(
+            input_batch.num_reqs,
+            dtype=torch.int64,
+            device=processed_logits.device,
+        )
+        transitions = self._gpu_select_groups_batched(
+            processed_logits=processed_logits,
+            input_batch=input_batch,
+            sampled=sampled,
+        )
+
+        if transitions:
+            req_idx_by_group = self._gpu_req_indices_by_group(
+                input_batch,
+                transitions,
+            )
+            self._apply_gpu_worker_rewrites(transitions, req_idx_by_group)
+            async_outputs = {
+                BEAM_TRANSITIONS_OUTPUT: AsyncBeamTransitions(
+                    transitions,
+                    buffer_pool=self._transition_buffer_pool,
+                )
+            }
+        else:
+            async_outputs = None
+
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.base_sampler.req_states.prefill_len.gpu,
+        )
+        return BeamSamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            async_outputs=async_outputs,
+        )
+
+    def _gpu_select_groups_batched(
+        self,
+        *,
+        processed_logits: torch.Tensor,
+        input_batch: InputBatch,
+        sampled: torch.Tensor,
+    ) -> _BeamTransitionGpuBatch | None:
+        present_by_gid, slot_to_batch_by_gid = self._batch_view_by_group(
+            input_batch,
+            processed_logits.shape[0],
+        )
+        key, entries = self._collect_select_entries(present_by_gid)
+        if key is None:
+            return None
+
+        bw, no_repeat, eos = key
+        device = processed_logits.device
+        group_count = len(entries)
+        lengths_cpu = [
+            int(state["length"])
+            for _gid, _gr, state, _present in entries
+        ]
+        prompt_lens_cpu = [
+            int(state["prompt_len"])
+            for _gid, _gr, state, _present in entries
+        ]
+        pools = {
+            state["pool"]
+            for _gid, _gr, state, _present in entries
+        }
+        assert len(pools) == 1
+        pool = pools.pop()
+        state_slots_cpu = [
+            int(state["slot"])
+            for _gid, _gr, state, _present in entries
+        ]
+        max_length = max(lengths_cpu)
+        present_slots_cpu: list[list[int]] = []
+        present_rows_cpu: list[list[int]] = []
+        present_mask_cpu: list[list[bool]] = []
+        present_counts: list[int] = []
+        for _gid, _gr, _state, present in entries:
+            slots = [slot for slot, _row in present]
+            rows = [row for _slot, row in present]
+            count = min(len(slots), bw)
+            pad_slot = slots[0]
+            pad_row = rows[0]
+            present_slots_cpu.append(slots[:bw] + [pad_slot] * (bw - count))
+            present_rows_cpu.append(rows[:bw] + [pad_row] * (bw - count))
+            present_mask_cpu.append([True] * count + [False] * (bw - count))
+            present_counts.append(count)
+        slot_to_batch_cpu = [
+            slot_to_batch_by_gid.get(gid, [-1] * bw)
+            for gid, _gr, _state, _present in entries
+        ]
+        present_slots = _copy_cpu_values_to_gpu(
+            present_slots_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+        present_rows = _copy_cpu_values_to_gpu(
+            present_rows_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+        present_mask = _copy_cpu_values_to_gpu(
+            present_mask_cpu,
+            dtype=torch.bool,
+            device=device,
+        )
+        lengths = _copy_cpu_values_to_gpu(
+            lengths_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+        state_slots_by_group = _copy_cpu_values_to_gpu(
+            state_slots_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+        slot_to_batch = _copy_cpu_values_to_gpu(
+            slot_to_batch_cpu,
+            dtype=torch.long,
+            device=device,
+        )
+
+        flat_rows = present_rows.reshape(-1)
+        vocab_size = processed_logits.shape[1]
+        logprobs = torch.log_softmax(
+            processed_logits[flat_rows].float(),
+            dim=-1,
+        ).view(group_count, bw, vocab_size)
+
+        if no_repeat > 0 and max_length >= no_repeat:
+            grid = (group_count, bw, max_length - (no_repeat - 1))
+            _batched_no_repeat_ngram_mask_kernel[grid](
+                pool.tokens,
+                logprobs,
+                present_slots,
+                state_slots_by_group,
+                lengths,
+                no_repeat,
+                bw,
+                pool.tokens.stride(0),
+                pool.tokens.stride(1),
+                pool.tokens.stride(2),
+                logprobs.stride(0),
+                logprobs.stride(1),
+                logprobs.stride(2),
+            )
+
+        k = min(vocab_size, 2 * bw)
+        vals, ids = torch.topk(logprobs, k, dim=-1)
+        bases = pool.cum[
+            state_slots_by_group[:, None],
+            present_slots,
+        ].unsqueeze(2)
+        scores = vals + bases
+        scores = scores.masked_fill(~present_mask.unsqueeze(2), _NEG_INF)
+
+        eos_completion_scores = None
+        completion_slots = None
+        completion_tokens = None
+        if eos is not None:
+            flat_scores_all, flat_idx_all = torch.topk(
+                scores.reshape(group_count, -1),
+                min(2 * bw, scores.shape[1] * scores.shape[2]),
+                dim=-1,
+            )
+            row_all = flat_idx_all // k
+            tok_all = ids.reshape(group_count, -1).gather(1, flat_idx_all)
+            eos_mask = tok_all == int(eos)
+            rank = torch.arange(
+                flat_scores_all.shape[1],
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            completion_mask = eos_mask & (rank < bw)
+            eos_completion_scores = flat_scores_all.masked_fill(
+                ~completion_mask, _INIT_NEG
+            )
+            completion_slots = present_slots.gather(1, row_all)
+            completion_tokens = tok_all
+            scores = scores.masked_fill(ids == int(eos), _NEG_INF)
+
+        # Global per-group top-k over beam rows x token candidates.
+        flat_scores, flat_idx = torch.topk(
+            scores.reshape(group_count, -1),
+            bw,
+            dim=-1,
+        )
+        # Decode flattened candidate indices back to row and token rank.
+        src_pos, _tok_pos = flat_idx // k, flat_idx % k
+        src_slots_by_group = present_slots.gather(1, src_pos)
+        selected_tokens_by_group = ids.reshape(group_count, -1).gather(1, flat_idx)
+        dst_slots_by_group = present_slots[:, :bw]
+
+        (
+            completion_sequences,
+            completion_scores,
+            completion_lens,
+        ) = _build_completion_tensors_batched(
+            entries=entries,
+            pool=pool,
+            state_slots_by_group=state_slots_by_group,
+            lengths_cpu=lengths_cpu,
+            prompt_lens_cpu=prompt_lens_cpu,
+            completion_slots=completion_slots,
+            completion_tokens=completion_tokens,
+            completion_scores=eos_completion_scores,
+        )
+
+        (
+            fork_src_by_group,
+            active_mask_by_group,
+        ) = _rewrite_beam_states_batched(
+            entries=entries,
+            pool=pool,
+            state_slots_by_group=state_slots_by_group,
+            lengths_cpu=lengths_cpu,
+            sampled=sampled,
+            slot_to_batch=slot_to_batch,
+            present_mask=present_mask,
+            dst_slots_by_group=dst_slots_by_group,
+            src_slots_by_group=src_slots_by_group,
+            selected_tokens_by_group=selected_tokens_by_group,
+            selected_scores_by_group=flat_scores,
+            beam_width=bw,
+        )
+        transition_tokens, transition_cum = _snapshot_transition_state_batched(
+            pool=pool,
+            state_slots_by_group=state_slots_by_group,
+            lengths=lengths,
+            max_length=max_length,
+            beam_width=bw,
+        )
+
+        gids: list[str] = []
+        steps: list[int] = []
+        for group_idx, (gid, _gr, state, _present) in enumerate(entries):
+            length = lengths_cpu[group_idx]
+            gids.append(gid)
+            steps.append(int(state["step"]))
+            state["length"] = length + 1
+            state["step"] = int(state["step"]) + 1
+
+        return _BeamTransitionGpuBatch(
+            gids=tuple(gids),
+            steps=tuple(steps),
+            prefix_lens=tuple(lengths_cpu),
+            prompt_lens=tuple(prompt_lens_cpu),
+            active_counts=tuple(present_counts),
+            dst_slots=dst_slots_by_group,
+            src_slots=src_slots_by_group,
+            fork_src=fork_src_by_group,
+            active_mask=active_mask_by_group,
+            tokens=transition_tokens,
+            cum=transition_cum,
+            completion_scores=completion_scores,
+            completion_sequences=completion_sequences,
+            completion_lens=completion_lens,
+        )
+
+    def _collect_select_entries(
+        self,
+        present_by_gid: dict[str, list[tuple[int, int]]],
+    ) -> tuple[_SelectKey | None, list[_SelectEntry]]:
+        """Collect one homogeneous selection batch for the MRV2 beam path."""
+        key: _SelectKey | None = None
+        entries: list[_SelectEntry] = []
+        for gid, present in present_by_gid.items():
+            gr = self.groups.get(gid)
+            if gr is None:
+                continue
+            state = self._gpu_group_state.get(gid)
+            if state is None:
+                self._init_gpu_group_state(gid, gr)
+                state = self._gpu_group_state[gid]
+            bw = gr.beam_width
+            if bw <= 1:
+                continue
+            group_key = (
+                bw,
+                int(gr.no_repeat_ngram_size),
+                gr.eos_token_id,
+            )
+            if key is None:
+                key = group_key
+            elif group_key != key:
+                raise RuntimeError(
+                    "BeamSearchMRV2Sampler requires homogeneous beam "
+                    "settings within a scheduler batch."
+                )
+            entries.append((gid, gr, state, present))
+        return key, entries
+
+    def _batch_view_by_group(
+        self,
+        input_batch: InputBatch,
+        num_logits: int,
+    ) -> tuple[dict[str, list[tuple[int, int]]], dict[str, list[int]]]:
+        present_by_gid: dict[str, list[tuple[int, int]]] = {}
+        slot_to_batch_by_gid: dict[str, list[int]] = {}
+        for batch_idx, req_id in enumerate(input_batch.req_ids):
+            entry = self.req_to_group.get(req_id)
+            if entry is None:
+                continue
+            gid, slot = entry
+            gr = self.groups.get(gid)
+            if gr is None or not (0 <= slot < gr.beam_width):
+                continue
+            slot_to_batch = slot_to_batch_by_gid.get(gid)
+            if slot_to_batch is None:
+                slot_to_batch = [-1] * gr.beam_width
+                slot_to_batch_by_gid[gid] = slot_to_batch
+            slot_to_batch[slot] = batch_idx
+            if not self._request_will_sample(input_batch, batch_idx):
+                continue
+            if gr.active and not gr.active[slot]:
+                continue
+            logits_row = int(input_batch.cu_num_logits_np[batch_idx + 1] - 1)
+            if 0 <= logits_row < num_logits:
+                present_by_gid.setdefault(gid, []).append((slot, logits_row))
+        return present_by_gid, slot_to_batch_by_gid
+
+    def _gpu_req_indices_by_group(
+        self,
+        input_batch: InputBatch,
+        transitions: _BeamTransitionGpuBatch | None = None,
+    ) -> dict[str, torch.Tensor] | torch.Tensor:
+        """Build GPU request-index rows for each beam group slot."""
+        req_states = self.base_sampler.req_states
+        device = req_states.all_token_ids.gpu.device
+        if transitions is not None:
+            group_to_idx = {
+                gid: group_idx
+                for group_idx, gid in enumerate(transitions.gids)
+            }
+            beam_width = int(transitions.dst_slots.shape[1])
+            rows = [[-1] * beam_width for _gid in transitions.gids]
+            for batch_idx, req_id in enumerate(input_batch.req_ids):
+                entry = self.req_to_group.get(req_id)
+                if entry is None:
+                    continue
+                gid, slot = entry
+                group_idx = group_to_idx.get(gid)
+                if group_idx is None or not (0 <= slot < beam_width):
+                    continue
+                rows[group_idx][slot] = int(input_batch.idx_mapping_np[batch_idx])
+            return _copy_cpu_values_to_gpu(
+                rows,
+                dtype=torch.long,
+                device=device,
+            )
+
+        req_idx_by_group: dict[str, list[int]] = {}
+        for batch_idx, req_id in enumerate(input_batch.req_ids):
+            entry = self.req_to_group.get(req_id)
+            if entry is None:
+                continue
+            gid, slot = entry
+            gr = self.groups.get(gid)
+            if gr is None or not (0 <= slot < gr.beam_width):
+                continue
+            req_idx_by_slot = req_idx_by_group.get(gid)
+            if req_idx_by_slot is None:
+                req_idx_by_slot = [-1] * gr.beam_width
+                req_idx_by_group[gid] = req_idx_by_slot
+            req_idx_by_slot[slot] = int(input_batch.idx_mapping_np[batch_idx])
+
+        return {
+            gid: _copy_cpu_values_to_gpu(
+                req_idx_list,
+                dtype=torch.long,
+                device=device,
+            )
+            for gid, req_idx_list in req_idx_by_group.items()
+        }
+
+    def _apply_gpu_worker_rewrites(
+        self,
+        transitions: dict[str, dict[str, Any]] | _BeamTransitionGpuBatch,
+        req_idx_by_group: dict[str, torch.Tensor] | torch.Tensor,
+    ) -> None:
+        """Apply beam history rewrites to MRV2 worker token and block state."""
+        if self.block_tables is None or not self.self_attn_group_indices:
+            return
+        if isinstance(transitions, _BeamTransitionGpuBatch):
+            assert isinstance(req_idx_by_group, torch.Tensor)
+            self._apply_gpu_worker_rewrites_batched(
+                transitions,
+                req_idx_by_group,
+            )
+            return
+
+        req_states = self.base_sampler.req_states
+        rewrite_buckets: dict[int, list[tuple[
+            dict[str, Any],
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]]] = {}
+        for gid, transition in transitions.items():
+            req_idx_by_slot = req_idx_by_group.get(gid)
+            if req_idx_by_slot is None:
+                continue
+            dst_slots = transition["dst_slots"]
+            src_slots = transition["src_slots"]
+            prefix_len = int(transition["prefix_len"])
+            dst_req_idx = req_idx_by_slot[dst_slots]
+            src_req_idx = req_idx_by_slot[src_slots]
+            rewrite_buckets.setdefault(prefix_len, []).append((
+                transition,
+                dst_slots,
+                src_slots,
+                dst_req_idx,
+                src_req_idx,
+            ))
+
+        for prefix_len, entries in rewrite_buckets.items():
+            dst_req_idx = _cat_tensors([entry[3] for entry in entries])
+            req_states.total_len.gpu.index_fill_(0, dst_req_idx, prefix_len)
+            req_states.num_computed_tokens.gpu.index_fill_(
+                0, dst_req_idx, prefix_len
+            )
+            self._pending_computed_resets.append((
+                dst_req_idx.clone(),
+                prefix_len,
+            ))
+            if prefix_len <= 0:
+                continue
+
+            if len(entries) == 1:
+                transition, dst_slots, _src_slots, _dst_req_idx, src_req_idx = (
+                    entries[0]
+                )
+                token_source = transition["tokens"].to(
+                    req_states.all_token_ids.gpu.dtype
+                )
+                token_src_rows = dst_slots
+            else:
+                token_source = torch.cat([
+                    entry[0]["tokens"][entry[1], :prefix_len].to(
+                        req_states.all_token_ids.gpu.dtype
+                    )
+                    for entry in entries
+                ])
+                token_src_rows = torch.arange(
+                    token_source.shape[0],
+                    dtype=torch.long,
+                    device=token_source.device,
+                )
+                src_req_idx = _cat_tensors([entry[4] for entry in entries])
+
+            _copy_prefix_rows(
+                src=token_source,
+                dst=req_states.all_token_ids.gpu,
+                src_rows=token_src_rows,
+                dst_rows=dst_req_idx,
+                n_cols=prefix_len,
+            )
+
+            for group_idx in self.self_attn_group_indices:
+                block_size = int(self.block_tables.block_sizes[group_idx])
+                prefix_blocks = prefix_len // block_size
+                if prefix_blocks <= 0:
+                    continue
+                table = self.block_tables.block_tables[group_idx].gpu
+                block_prefix = table[src_req_idx, :prefix_blocks].clone()
+                prefix_rows = torch.arange(
+                    block_prefix.shape[0],
+                    dtype=torch.long,
+                    device=block_prefix.device,
+                )
+                _copy_prefix_rows(
+                    src=block_prefix,
+                    dst=table,
+                    src_rows=prefix_rows,
+                    dst_rows=dst_req_idx,
+                    n_cols=prefix_blocks,
+                )
+
+    def _apply_gpu_worker_rewrites_batched(
+        self,
+        transitions: _BeamTransitionGpuBatch,
+        req_idx_by_group: torch.Tensor,
+    ) -> None:
+        """Apply transition rewrites with fixed plugin launch count."""
+        req_states = self.base_sampler.req_states
+        group_count = len(transitions.gids)
+        if group_count == 0:
+            return
+
+        device = req_idx_by_group.device
+        beam_width = int(transitions.dst_slots.shape[1])
+        prefix_lens = _copy_cpu_values_to_gpu(
+            transitions.prefix_lens,
+            dtype=torch.long,
+            device=device,
+        )
+        active_counts = _copy_cpu_values_to_gpu(
+            transitions.active_counts,
+            dtype=torch.long,
+            device=device,
+        )
+        max_prefix_len = max(transitions.prefix_lens, default=0)
+        pending_req_idx = torch.empty(
+            (group_count, beam_width),
+            dtype=torch.long,
+            device=device,
+        )
+        pending_prefix_lens = torch.empty(
+            (group_count, beam_width),
+            dtype=torch.long,
+            device=device,
+        )
+
+        n_cols = max(max_prefix_len, 1)
+        block_n = min(triton.next_power_of_2(n_cols), 1024)
+        grid = (group_count, beam_width, triton.cdiv(n_cols, block_n))
+        _rewrite_worker_tokens_kernel[grid](
+            transitions.tokens,
+            req_states.all_token_ids.gpu,
+            req_states.total_len.gpu,
+            req_states.num_computed_tokens.gpu,
+            req_idx_by_group,
+            transitions.dst_slots,
+            prefix_lens,
+            active_counts,
+            pending_req_idx,
+            pending_prefix_lens,
+            beam_width,
+            transitions.tokens.stride(0),
+            transitions.tokens.stride(1),
+            transitions.tokens.stride(2),
+            req_states.all_token_ids.gpu.stride(0),
+            req_states.all_token_ids.gpu.stride(1),
+            req_idx_by_group.stride(0),
+            req_idx_by_group.stride(1),
+            transitions.dst_slots.stride(0),
+            transitions.dst_slots.stride(1),
+            pending_req_idx.stride(0),
+            pending_req_idx.stride(1),
+            BLOCK_N=block_n,
+        )
+        self._pending_computed_resets.append((
+            pending_req_idx.reshape(-1),
+            pending_prefix_lens.reshape(-1),
+        ))
+
+        for group_idx in self.self_attn_group_indices:
+            block_size = int(self.block_tables.block_sizes[group_idx])
+            max_prefix_blocks = max_prefix_len // block_size
+            if max_prefix_blocks <= 0:
+                continue
+            table = self.block_tables.block_tables[group_idx].gpu
+            block_prefix = torch.empty(
+                (group_count, beam_width, max_prefix_blocks),
+                dtype=table.dtype,
+                device=table.device,
+            )
+            block_n = min(triton.next_power_of_2(max_prefix_blocks), 1024)
+            grid = (
+                group_count,
+                beam_width,
+                triton.cdiv(max_prefix_blocks, block_n),
+            )
+            _snapshot_worker_block_prefix_kernel[grid](
+                table,
+                block_prefix,
+                req_idx_by_group,
+                transitions.src_slots,
+                prefix_lens,
+                active_counts,
+                block_size,
+                beam_width,
+                table.stride(0),
+                table.stride(1),
+                block_prefix.stride(0),
+                block_prefix.stride(1),
+                block_prefix.stride(2),
+                req_idx_by_group.stride(0),
+                req_idx_by_group.stride(1),
+                transitions.src_slots.stride(0),
+                transitions.src_slots.stride(1),
+                BLOCK_N=block_n,
+            )
+            _rewrite_worker_block_prefix_kernel[grid](
+                table,
+                block_prefix,
+                req_idx_by_group,
+                transitions.dst_slots,
+                prefix_lens,
+                active_counts,
+                block_size,
+                beam_width,
+                table.stride(0),
+                table.stride(1),
+                block_prefix.stride(0),
+                block_prefix.stride(1),
+                block_prefix.stride(2),
+                req_idx_by_group.stride(0),
+                req_idx_by_group.stride(1),
+                transitions.dst_slots.stride(0),
+                transitions.dst_slots.stride(1),
+                BLOCK_N=block_n,
+            )
+
+    def trace_gathered_block_tables(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+    ) -> None:
+        if (
+            not _BLOCK_TRACE
+            or self._block_gather_trace_count >= _BLOCK_TRACE_STEPS
+        ):
+            return
+
+        for batch_idx, req_id in enumerate(input_batch.req_ids):
+            entry = self.req_to_group.get(req_id)
+            if entry is None:
+                continue
+            gid, beam_idx = entry
+            req_idx = int(input_batch.idx_mapping_np[batch_idx])
+            for group_idx in self.self_attn_group_indices:
+                if group_idx >= len(block_tables):
+                    continue
+                count = int(
+                    self.block_tables.num_blocks.np[group_idx, req_idx]
+                    if self.block_tables is not None
+                    else _BLOCK_TRACE_WIDTH
+                )
+                width = min(max(count, 0), _BLOCK_TRACE_WIDTH)
+                vals = (
+                    block_tables[group_idx][batch_idx, :width]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                print(
+                    "[BEAM_BLOCK_TRACE gather] "
+                    f"gid={gid} beam={beam_idx} batch={batch_idx} "
+                    f"req_idx={req_idx} group={group_idx} blocks={vals} "
+                    f"count={count} "
+                    f"scheduled={int(input_batch.num_scheduled_tokens[batch_idx])} "
+                    f"ncomp_np={int(input_batch.num_computed_tokens_np[batch_idx])}",
+                    flush=True,
+                )
+                self._block_gather_trace_count += 1
+                if self._block_gather_trace_count >= _BLOCK_TRACE_STEPS:
+                    return
+
+    def apply_pending_rewrites(self) -> None:
+        self._apply_pending_computed_resets()
+
+    def _apply_pending_computed_resets(self) -> None:
+        if not self._pending_computed_resets:
+            return
+        num_computed = self.base_sampler.req_states.num_computed_tokens.gpu
+        for req_idx, prefix_len in self._pending_computed_resets:
+            if isinstance(prefix_len, int):
+                num_computed.index_fill_(0, req_idx, prefix_len)
+                continue
+            n_items = req_idx.numel()
+            block_n = 256
+            _set_num_computed_kernel[(triton.cdiv(n_items, block_n),)](
+                num_computed,
+                req_idx,
+                prefix_len,
+                n_items,
+                req_idx.stride(0),
+                prefix_len.stride(0),
+                BLOCK_N=block_n,
+            )
+        self._pending_computed_resets.clear()
+
+
+class _TransitionBufferPool:
+    """Persistent GPU slots for async transition snapshots."""
+
+    def __init__(self, num_slots: int | None = None) -> None:
+        if num_slots is None:
+            num_slots = int(os.getenv("VLLM_BEAM_TRANSITION_BUFFER_SLOTS", "8"))
+        self.num_slots = max(1, num_slots)
+        self._next_slot = 0
+        self._buffers: dict[
+            tuple[str, tuple[int, ...], torch.dtype, torch.device],
+            torch.Tensor,
+        ] = {}
+
+    def snapshot(
+        self,
+        batch: _BeamTransitionGpuBatch,
+    ) -> dict[str, torch.Tensor | None]:
+        """Copy a GPU transition batch into persistent slots."""
+        slot = self._next_slot
+        self._next_slot = (self._next_slot + 1) % self.num_slots
+
+        tensors: dict[str, torch.Tensor | None] = {}
+        for key, value in batch.async_tensors().items():
+            if value is None:
+                tensors[key] = None
+                continue
+            out = self._slot_batch_view(key, value, slot)
+            out.copy_(value)
+            tensors[key] = out
+
+        return tensors
+
+    def _slot_batch_view(
+        self,
+        key: str,
+        value: torch.Tensor,
+        slot: int,
+    ) -> torch.Tensor:
+        buffer_key = (key, tuple(value.shape[1:]), value.dtype, value.device)
+        buffer = self._buffers.get(buffer_key)
+        batch_size = value.shape[0]
+        if buffer is None or buffer.shape[1] < batch_size:
+            capacity = batch_size
+            if buffer is not None:
+                capacity = max(capacity, buffer.shape[1] * 2)
+            self._buffers[buffer_key] = torch.empty(
+                (self.num_slots, capacity, *value.shape[1:]),
+                dtype=value.dtype,
+                device=value.device,
+            )
+            buffer = self._buffers[buffer_key]
+        return buffer[slot, :batch_size]
+
+
+class AsyncBeamTransitions:
+    def __init__(
+        self,
+        transitions: _BeamTransitionGpuBatch | None = None,
+        *,
+        tensors: dict[str, torch.Tensor | None] | None = None,
+        gids: tuple[str, ...] = (),
+        steps: tuple[int, ...] = (),
+        prefix_lens: tuple[int, ...] = (),
+        prompt_lens: tuple[int, ...] = (),
+        completion_lens: tuple[int, ...] = (),
+        gpu_refs: tuple[torch.Tensor, ...] = (),
+        buffer_pool: _TransitionBufferPool | None = None,
+    ) -> None:
+        """Hold sampler transitions until vLLM async output finalization."""
+        self.gpu_batch = transitions
+        if transitions is not None:
+            self.gids = transitions.gids
+            self.steps = transitions.steps
+            self.prefix_lens = transitions.prefix_lens
+            self.prompt_lens = transitions.prompt_lens
+            self.completion_lens = transitions.completion_lens
+        else:
+            self.gids = gids
+            self.steps = steps
+            self.prefix_lens = prefix_lens
+            self.prompt_lens = prompt_lens
+            self.completion_lens = completion_lens
+        self.tensors = tensors
+        self.gpu_refs = gpu_refs
+        self._buffer_pool = buffer_pool or _TransitionBufferPool()
+
+    def to_cpu_nonblocking(self) -> "AsyncBeamTransitions":
+        """Stage batched transition tensors for CPU finalization."""
+        with _gpu_sync_check():
+            tensors = self.tensors
+            if tensors is None:
+                assert self.gpu_batch is not None
+                tensors = self._buffer_pool.snapshot(self.gpu_batch)
+
+            cpu_tensors: dict[str, torch.Tensor | None] = {}
+            gpu_refs: list[torch.Tensor] = []
+            for key, value in tensors.items():
+                if value is None or value.device.type == "cpu":
+                    cpu_tensors[key] = value
+                    continue
+                cpu_tensors[key] = value.to("cpu", non_blocking=True)
+                gpu_refs.append(value)
+            return AsyncBeamTransitions(
+                tensors=cpu_tensors,
+                gids=self.gids,
+                steps=self.steps,
+                prefix_lens=self.prefix_lens,
+                prompt_lens=self.prompt_lens,
+                completion_lens=self.completion_lens,
+                gpu_refs=tuple(gpu_refs),
+                buffer_pool=self._buffer_pool,
+            )
+
+    def to_output(self) -> tuple[BeamTransition, ...]:
+        """Convert staged tensors into CPU BeamTransition records."""
+        tensors = self.tensors
+        if tensors is None:
+            if self.gpu_batch is None:
+                return ()
+            tensors = self.gpu_batch.async_tensors()
+        return tuple(
+            _materialize_transition(
+                self._transition_data(group_idx, gid, tensors)
+            )
+            for group_idx, gid in enumerate(self.gids)
+        )
+
+    def _transition_data(
+        self,
+        group_idx: int,
+        gid: str,
+        tensors: dict[str, torch.Tensor | None],
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "gid": gid,
+            "step": self.steps[group_idx],
+            "prefix_len": self.prefix_lens[group_idx],
+            "prompt_len": self.prompt_lens[group_idx],
+        }
+        if self.completion_lens:
+            data["completion_len"] = self.completion_lens[group_idx]
+        for key, value in tensors.items():
+            data[key] = None if value is None else value[group_idx]
+        return data
+
+
+def _materialize_transition(data: dict[str, Any]) -> BeamTransition:
+    """Turn one async sampler sidecar into a scheduler transition."""
+    prompt_len = int(data["prompt_len"])
+    prefix_len = int(data["prefix_len"])
+    length = prefix_len + 1
+    token_rows = data["tokens"][:, :length].tolist()
+    generated = [
+        tuple(int(tok) for tok in row[prompt_len:length])
+        for row in token_rows
+    ]
+    cum = tuple(float(x) for x in data["cum"].tolist())
+    fork_src = tuple(int(x) for x in data["fork_src"].tolist())
+    active_mask = data["active_mask"].tolist()
+    active_slots = tuple(
+        slot
+        for slot, active in enumerate(active_mask)
+        if active
+    )
+
+    completions: list[tuple[tuple[int, ...], float]] = []
+    completion_scores = data.get("completion_scores")
+    completion_sequences = data.get("completion_sequences")
+    if (
+        completion_scores is not None
+        and completion_sequences is not None
+        and completion_scores.numel() > 0
+    ):
+        scores = completion_scores.tolist()
+        sequences = completion_sequences.tolist()
+        completion_len = data.get("completion_len")
+        for seq, score in zip(sequences, scores):
+            if score <= _INIT_NEG / 2:
+                continue
+            if completion_len is not None:
+                seq = seq[: int(completion_len)]
+            completions.append(
+                (tuple(int(tok) for tok in seq), float(score))
+            )
+
+    return BeamTransition(
+        group_id=str(data["gid"]),
+        step_id=int(data["step"]),
+        prefix_len=int(data["prefix_len"]) - prompt_len,
+        active_slots=active_slots,
+        fork_src=fork_src,
+        tokens=tuple(generated),
+        cum=cum,
+        completions=tuple(completions),
+        inactive_slots=(),
+    )

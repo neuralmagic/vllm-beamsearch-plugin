@@ -1,11 +1,10 @@
-"""BeamSearchScheduler — V1 plugin doing in-flight beam search.
+"""BeamSearchScheduler — MRV2 async plugin doing in-flight beam search.
 
 Matches the HF / V0 algorithm. At `add_request` we materialize
 `beam_width` sibling Request objects (one per beam) and add them all to
-the base scheduler. The per-step beam decision (which token each beam
-continues with, which beams fork/die) is made by
-`BeamSearchLogitsProcessor`; this scheduler executes the KV-cache side
-of those decisions.
+the base scheduler. The MRV2 sampler makes per-step beam decisions and
+emits `BeamTransition` records; this scheduler reconciles the CPU-side
+request/KV bookkeeping when those async outputs arrive.
 
 Per step (`update_from_output`):
   1. Suppress the beam-children outputs from the engine stream.
@@ -15,14 +14,14 @@ Per step (`update_from_output`):
      request id and finish all sibling children.
   4. Otherwise execute the LP's fork plan: for each slot whose
      `fork_src != slot`, rebase that slot's decoder (self-attention)
-     KV onto the parent's available full prefix blocks, then let the
-     next schedule() recompute any partial block suffix. Cross-attention
-     (encoder) KV is identical across beams and left untouched.
+     KV onto the parent's shareable prefix blocks by rewriting the block
+     table and refcounts. With one-token KV blocks this is a direct
+     full-prefix rewrite. Cross-attention (encoder) KV is identical across
+     beams and left untouched.
 """
 from __future__ import annotations
 
 import copy
-import builtins
 import os
 import time
 from collections.abc import Iterable
@@ -35,9 +34,10 @@ from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request, RequestStatus
 
+from .beam_types import BeamTransition
 from .beam_state import BeamGroup, CompletedBeam
 
-_RUNTIME_ATTR = "_vllm_beam_search_runtime_groups"
+_BEAM_TRANSITIONS_OUTPUT = "vllm_beam_search.transitions"
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -47,8 +47,7 @@ logger = init_logger(__name__)
 
 _DEBUG = bool(int(os.getenv("VLLM_BEAM_DEBUG", "0")))
 _TRACE = bool(int(os.getenv("VLLM_BEAM_TRACE", "0")))
-_COW = bool(int(os.getenv("VLLM_BEAM_COW", "0")))
-_COW_DEBUG = bool(int(os.getenv("VLLM_BEAM_COW_DEBUG", "0")))
+_SUMMARY = bool(int(os.getenv("VLLM_BEAM_SUMMARY", "0")))
 _EARLY_STOP_MIN_COMPLETIONS = int(
     os.getenv("VLLM_BEAM_EARLY_STOP_MIN_COMPLETIONS", "0")
 )
@@ -70,186 +69,114 @@ def _hotpath_log(component: str, dt_s: float, **fields: object) -> None:
     )
 
 
-def _install_history_rewrite_patches() -> None:
-    _patch_scheduler_history_rewrites()
-    _patch_gpu_model_runner_history_rewrites()
+def _install_worker_history_rewrite_hooks() -> None:
+    _patch_flash_attn_hopper_block_size_one()
+    _patch_mrv2_gpu_model_runner_history_rewrites()
 
 
-def _patch_scheduler_history_rewrites() -> None:
-    """Attach beam history/block-table rewrites to SchedulerOutput."""
-    import itertools
+def _flash_attn_hopper_block_size_one_enabled() -> bool:
+    if not bool(int(os.getenv("VLLM_BEAM_FA3_BLOCK_SIZE_ONE", "1"))):
+        return False
+    try:
+        from vllm.platforms import current_platform
+        from vllm.platforms.interface import DeviceCapability
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
-    if getattr(Scheduler, "_vllm_beam_history_rewrite_patched", False):
+        capability = current_platform.get_device_capability()
+        return (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability >= DeviceCapability(9, 0)
+            and capability < DeviceCapability(10, 0)
+            and get_flash_attn_version() == 3
+        )
+    except Exception:
+        return False
+
+
+def _patch_flash_attn_hopper_block_size_one() -> None:
+    """Advertise FA3 page-size-1 support on Hopper for beam experiments."""
+    try:
+        from vllm.v1.attention.backend import MultipleOf
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    except Exception:
         return
 
-    original_make_cached_request_data = Scheduler._make_cached_request_data
+    if getattr(FlashAttentionBackend, "_vllm_beam_fa3_bs1_patched", False):
+        return
 
-    def patched_make_cached_request_data(
-        self,
-        running_reqs,
-        resumed_reqs,
-        num_scheduled_tokens,
-        spec_decode_tokens,
-        req_to_new_blocks,
-    ):
-        data = original_make_cached_request_data(
-            self,
-            running_reqs,
-            resumed_reqs,
-            num_scheduled_tokens,
-            spec_decode_tokens,
-            req_to_new_blocks,
+    original_supported = FlashAttentionBackend.get_supported_kernel_block_sizes
+    original_shape = FlashAttentionBackend.get_kv_cache_shape
+
+    def patched_supported() -> list[int | MultipleOf]:
+        try:
+            supported = list(original_supported())
+        except AssertionError:
+            supported = [MultipleOf(16)]
+        if _flash_attn_hopper_block_size_one_enabled() and 1 not in supported:
+            supported.insert(0, 1)
+        return supported
+
+    def patched_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if block_size == 1 and _flash_attn_hopper_block_size_one_enabled():
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        return original_shape(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str,
         )
-        req_index_by_id = {req_id: idx for idx, req_id in enumerate(data.req_ids)}
-        rewrites = {}
-        for req in itertools.chain(running_reqs, resumed_reqs):
-            if not getattr(req, "_beam_history_rewrite_pending", False):
-                continue
-            req_id = req.request_id
-            idx = req_index_by_id.get(req_id)
-            if idx is None:
-                continue
-            cow_blocks = list(getattr(req, "_beam_cow_blocks", []) or [])
-            rewrites[req_id] = (
-                req.all_token_ids.copy(),
-                data.num_output_tokens[idx],
-                self.kv_cache_manager.get_block_ids(req_id),
-                req.num_computed_tokens,
-                cow_blocks,
-            )
-            if cow_blocks:
-                req._beam_cow_blocks = []
-            req._beam_history_rewrite_pending = False
-        if rewrites:
-            data.beam_history_rewrites = rewrites
-            if _COW_DEBUG:
-                print(
-                    f"[BEAM_HISTORY scheduler] rewrites={list(rewrites)}",
-                    flush=True,
-                )
-        return data
 
-    Scheduler._make_cached_request_data = patched_make_cached_request_data
-    Scheduler._vllm_beam_history_rewrite_patched = True
+    FlashAttentionBackend.get_supported_kernel_block_sizes = staticmethod(
+        patched_supported
+    )
+    FlashAttentionBackend.get_kv_cache_shape = staticmethod(patched_shape)
+    FlashAttentionBackend._vllm_beam_fa3_bs1_patched = True
 
 
-def _patch_gpu_model_runner_history_rewrites() -> None:
-    """Apply beam history/block-table rewrites to persistent worker rows."""
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
+    """Give MRV2 ModelState access to block tables for custom samplers."""
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+        from vllm.v1.kv_cache_interface import CrossAttentionSpec
+    except ImportError:
+        return
 
     if getattr(GPUModelRunner, "_vllm_beam_history_rewrite_patched", False):
         return
 
-    original_update_states = GPUModelRunner._update_states
+    original_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
 
-    def _copy_cow_blocks(self, rewrites):
-        grouped: dict[int, tuple[list[int], list[int]]] = {}
-        for _req_id, (_toks, _n_out, _blocks, _n_comp, cow_blocks) in rewrites.items():
-            for gid, src_block_id, dst_block_id in cow_blocks:
-                src_ids, dst_ids = grouped.setdefault(gid, ([], []))
-                src_ids.append(src_block_id)
-                dst_ids.append(dst_block_id)
-        if not grouped:
+    def _bind_beam_block_tables(self) -> None:
+        model_state = getattr(self, "model_state", None)
+        block_tables = getattr(self, "block_tables", None)
+        if model_state is None or block_tables is None:
             return
 
-        import torch
-
-        for gid, (src_ids, dst_ids) in grouped.items():
-            if gid >= len(self.kv_cache_config.kv_cache_groups) or not src_ids:
-                continue
-            layer_names = self.kv_cache_config.kv_cache_groups[gid].layer_names
-            copied_layers = 0
-            for layer_name in layer_names:
-                attn_layer = self.compilation_config.static_forward_context.get(
-                    layer_name
-                )
-                cache = getattr(attn_layer, "kv_cache", None)
-                if cache is None:
-                    continue
-                src = torch.tensor(src_ids, device=cache.device, dtype=torch.long)
-                dst = torch.tensor(dst_ids, device=cache.device, dtype=torch.long)
-                cache[dst] = cache[src]
-                copied_layers += 1
-            if _COW_DEBUG:
-                print(
-                    f"[BEAM_HISTORY worker] copied gid={gid} "
-                    f"layers={copied_layers} src={src_ids} dst={dst_ids}",
-                    flush=True,
-                )
-
-    def _apply_history_rewrite(
-        self,
-        req_id,
-        all_token_ids,
-        num_output_tokens,
-        block_ids,
-        num_computed_tokens,
-    ) -> bool:
-        req_idx = self.input_batch.req_id_to_index.get(req_id)
-        if req_idx is None:
-            return False
-
-        req_state = self.requests[req_id]
-        prompt_len = max(len(all_token_ids) - num_output_tokens, 0)
-        prompt_token_ids = list(all_token_ids[:prompt_len])
-        output_token_ids = list(all_token_ids[prompt_len:])
-
-        req_state.prompt_token_ids = prompt_token_ids
-        req_state.prompt_embeds = None
-        req_state.num_prompt_tokens = prompt_len
-        req_state.output_token_ids = output_token_ids
-        req_state.block_ids = block_ids
-        req_state.num_computed_tokens = num_computed_tokens
-
-        self.input_batch.req_output_token_ids[req_idx] = req_state.output_token_ids
-        self.input_batch.req_prompt_embeds.pop(req_idx, None)
-        self.input_batch.num_prompt_tokens[req_idx] = prompt_len
-        self.input_batch.num_tokens_no_spec[req_idx] = len(all_token_ids)
-        self.input_batch.num_computed_tokens_cpu[req_idx] = num_computed_tokens
-        if all_token_ids:
-            self.input_batch.token_ids_cpu[req_idx, :len(all_token_ids)] = (
-                all_token_ids
-            )
-            self.input_batch.is_token_ids[req_idx, :len(all_token_ids)] = True
-        self.input_batch.spec_token_ids[req_idx].clear()
-        self.input_batch.block_table.add_row(block_ids, req_idx)
-        return True
-
-    def patched_update_states(self, scheduler_output):
-        original_update_states(self, scheduler_output)
-
-        rewrites = getattr(
-            scheduler_output.scheduled_cached_reqs,
-            "beam_history_rewrites",
-            None,
+        self_attn_groups = tuple(
+            idx
+            for idx, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            if not isinstance(group.kv_cache_spec, CrossAttentionSpec)
         )
-        if not rewrites:
-            return
+        setattr(model_state, "_vllm_beam_block_tables", block_tables)
+        setattr(model_state, "_vllm_beam_self_attn_groups", self_attn_groups)
 
-        _copy_cow_blocks(self, rewrites)
-        rewrote = False
-        for req_id, (
-            all_token_ids,
-            num_output_tokens,
-            block_ids,
-            num_computed_tokens,
-            _cow_blocks,
-        ) in rewrites.items():
-            rewrote |= _apply_history_rewrite(
-                self,
-                req_id,
-                all_token_ids,
-                num_output_tokens,
-                block_ids,
-                num_computed_tokens,
-            )
+        beam_sampler = getattr(model_state, "beam_sampler", None)
+        if beam_sampler is not None and hasattr(beam_sampler, "set_block_tables"):
+            beam_sampler.set_block_tables(block_tables, self_attn_groups)
 
-        if rewrote:
-            self.input_batch.sampling_metadata = (
-                self.input_batch._make_sampling_metadata()
-            )
+    def patched_initialize_kv_cache(self, kv_cache_config):
+        original_initialize_kv_cache(self, kv_cache_config)
+        _bind_beam_block_tables(self)
 
-    GPUModelRunner._update_states = patched_update_states
+    GPUModelRunner.initialize_kv_cache = patched_initialize_kv_cache
     GPUModelRunner._vllm_beam_history_rewrite_patched = True
 
 
@@ -259,7 +186,6 @@ class _PrefixSnapshot:
 
     num_computed_tokens: int
     blocks_by_manager: dict[int, list[Any]]
-    cow_source_by_manager: dict[int, Any]
 
 
 @dataclass
@@ -267,6 +193,19 @@ class _UpdateStats:
     groups: int = 0
     finalized: int = 0
     rebases: int = 0
+
+
+@dataclass
+class _SummaryStats:
+    public_adds: int = 0
+    child_adds: int = 0
+    finalizes: int = 0
+    parent_outputs: int = 0
+    child_finishes: int = 0
+    cleanups: int = 0
+    external_finishes: int = 0
+    missing_runtime_waits: int = 0
+    no_best_finalizes: int = 0
 
 
 class BeamSearchScheduler(Scheduler):
@@ -297,19 +236,69 @@ class BeamSearchScheduler(Scheduler):
             log_stats=log_stats,
             **kwargs,
         )
+        if not self.use_v2_model_runner or not self.scheduler_config.async_scheduling:
+            raise RuntimeError(
+                "BeamSearchScheduler requires MRV2 with async scheduling enabled."
+            )
 
         self._prefix_caching_enabled = bool(self.cache_config.enable_prefix_caching)
         self._block_hasher: Any = None
 
         self.beam_groups: dict[str, BeamGroup] = {}
         self.beam_to_group: dict[str, str] = {}
+        self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+        self.pp_size = self.parallel_config.pipeline_parallel_size
 
         # Indices of the decoder (self-attention) KV managers — everything
         # that is not cross-attention. Computed lazily on first use.
         self._self_attn_mgr_idxs: list[int] | None = None
-        # Source blocks pinned until the worker has copied COW KV into the
-        # destination blocks on the next forward.
-        self._cow_release_blocks: list[Any] = []
+        self._summary_stats = _SummaryStats()
+        self._last_summary_s = 0.0
+
+    def _update_after_schedule(self, scheduler_output: "SchedulerOutput") -> None:
+        super()._update_after_schedule(scheduler_output)
+
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                continue
+
+            scheduler_output.pending_structured_output_tokens |= (
+                request.use_structured_output
+                and request.num_output_placeholders > 0
+            )
+            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            request.num_output_placeholders += (
+                self.num_sampled_tokens_per_step + cur_num_spec_tokens
+            )
+            request.spec_token_ids = self._spec_token_placeholders
+
+            request.next_decode_eligible_step = self.current_step + self.pp_size
+
+    def _update_request_with_output(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+    ) -> tuple[list[int], bool]:
+        if request.async_tokens_to_discard > 0:
+            request.async_tokens_to_discard -= 1
+            return [], False
+
+        status_before_update = request.status
+        new_token_ids, stopped = super()._update_request_with_output(
+            request, new_token_ids
+        )
+
+        request.num_output_placeholders -= len(new_token_ids)
+        assert request.num_output_placeholders >= 0
+
+        if status_before_update == RequestStatus.RUNNING:
+            self.kv_cache_manager.cache_blocks(
+                request,
+                request.num_computed_tokens - request.num_output_placeholders,
+            )
+        return new_token_ids, stopped
 
     # ------------------------------------------------------------------
     # add_request: detect beam, pre-create children
@@ -345,6 +334,7 @@ class BeamSearchScheduler(Scheduler):
             beam_width=beam_width,
             length_penalty=float(extra.get("length_penalty", 1.0)),
         )
+        self._summary_stats.public_adds += 1
         self.beam_groups[request.request_id] = group
 
         for i in range(beam_width):
@@ -353,6 +343,7 @@ class BeamSearchScheduler(Scheduler):
             group.beam_requests.append(child)
             self.beam_to_group[child.request_id] = request.request_id
             super().add_request(child)
+            self._summary_stats.child_adds += 1
 
         if _DEBUG:
             print(f"[BEAM] add_request orig={request.request_id} "
@@ -429,6 +420,7 @@ class BeamSearchScheduler(Scheduler):
         )
 
         finished = super().finish_requests(expanded_ids, finished_status)
+        self._summary_stats.external_finishes += len(finished)
         if not cleanup_groups:
             return finished
 
@@ -512,6 +504,7 @@ class BeamSearchScheduler(Scheduler):
     def schedule(self) -> "SchedulerOutput":
         t0 = time.perf_counter() if _HOTPATH_TIMING else 0.0
         scheduler_output = super().schedule()
+        self._clamp_async_beam_decode_chunks(scheduler_output)
         if _HOTPATH_TIMING:
             _hotpath_log(
                 "beam_scheduler_schedule_total",
@@ -522,6 +515,42 @@ class BeamSearchScheduler(Scheduler):
             )
         return scheduler_output
 
+    def _clamp_async_beam_decode_chunks(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        total_trimmed = 0
+        for req_id, scheduled in list(
+            scheduler_output.num_scheduled_tokens.items()
+        ):
+            if scheduled <= 1 or req_id not in self.beam_to_group:
+                continue
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+
+            # The initial decoder prompt is scheduled as a normal prefill
+            # chunk. Only clamp decode chunks, where beam search has selected
+            # exactly one next token for MRV2 to consume.
+            prev_computed = request.num_computed_tokens - scheduled
+            if prev_computed < request.num_prompt_tokens:
+                continue
+
+            trimmed = scheduled - 1
+            scheduler_output.num_scheduled_tokens[req_id] = 1
+            scheduler_output.total_num_scheduled_tokens -= trimmed
+            request.num_computed_tokens -= trimmed
+            request.is_prefill_chunk = request.num_computed_tokens < (
+                request.num_tokens + request.num_output_placeholders
+            )
+            total_trimmed += trimmed
+
+        if total_trimmed and _DEBUG:
+            print(
+                f"[BEAM] clamped async decode tokens trimmed={total_trimmed}",
+                flush=True,
+            )
+
     def update_from_output(
         self,
         scheduler_output: "SchedulerOutput",
@@ -531,7 +560,6 @@ class BeamSearchScheduler(Scheduler):
         outputs = super().update_from_output(scheduler_output, model_runner_output)
         t_plugin = time.perf_counter() if _HOTPATH_TIMING else 0.0
 
-        self._release_cow_blocks()
         finished_children = self._suppress_child_outputs(outputs)
         if not self.beam_groups:
             if _HOTPATH_TIMING:
@@ -543,11 +571,11 @@ class BeamSearchScheduler(Scheduler):
                 )
             return outputs
 
-        lp_groups = self._find_lp_runtime()
+        transitions = self._beam_transitions_from_output(model_runner_output)
         if _DEBUG:
             print(
                 f"[BEAM] update groups={list(self.beam_groups)} "
-                f"lp_groups={list(lp_groups or {})} "
+                f"transitions={list(transitions)} "
                 f"outputs={[(ci, len(eco.outputs)) for ci, eco in outputs.items()]}",
                 flush=True,
             )
@@ -559,18 +587,20 @@ class BeamSearchScheduler(Scheduler):
                 continue
             stats.groups += 1
 
-            gr = lp_groups.get(group.orig_request_id) if lp_groups else None
-            self._drain_logits_processor_group(group, gr)
+            transition = transitions.get(group.orig_request_id)
+            source = transition
+            if transition is not None:
+                self._drain_beam_transition(group, transition)
 
-            active_slots = self._active_slots(group, gr)
+            active_slots = self._active_slots(group, source)
             if self._should_finalize_group(
-                group, gr, active_slots, finished_children
+                group, source, active_slots, finished_children
             ):
-                self._finalize_group(group, outputs, gr)
+                self._finalize_group(group, outputs, source)
                 stats.finalized += 1
                 continue
 
-            stats.rebases += self._apply_fork_plan(group, gr, active_slots)
+            stats.rebases += self._apply_fork_plan(group, source, active_slots)
 
         if _HOTPATH_TIMING:
             _hotpath_log(
@@ -588,13 +618,31 @@ class BeamSearchScheduler(Scheduler):
                 rebases=stats.rebases,
                 outputs=sum(len(eco.outputs) for eco in outputs.values()),
             )
+        self._maybe_log_summary()
         return outputs
 
-    def _release_cow_blocks(self) -> None:
-        if not self._cow_release_blocks:
+    def _maybe_log_summary(self, force: bool = False) -> None:
+        if not _SUMMARY:
             return
-        self.kv_cache_manager.block_pool.free_blocks(self._cow_release_blocks)
-        self._cow_release_blocks = []
+        now = time.monotonic()
+        if not force and now - self._last_summary_s < 1.0:
+            return
+        self._last_summary_s = now
+        stats = self._summary_stats
+        print(
+            "[BEAM_SUMMARY] "
+            f"adds={stats.public_adds} child_adds={stats.child_adds} "
+            f"finalizes={stats.finalizes} parent_outputs={stats.parent_outputs} "
+            f"child_finishes={stats.child_finishes} cleanups={stats.cleanups} "
+            f"external_finishes={stats.external_finishes} "
+            f"missing_runtime_waits={stats.missing_runtime_waits} "
+            f"no_best_finalizes={stats.no_best_finalizes} "
+            f"live_groups={len(self.beam_groups)} "
+            f"beam_children={len(self.beam_to_group)} "
+            f"base_unfinished={super().get_num_unfinished_requests()} "
+            f"running={len(self.running)} waiting={len(self.waiting)}",
+            flush=True,
+        )
 
     def _suppress_child_outputs(
         self,
@@ -623,14 +671,22 @@ class BeamSearchScheduler(Scheduler):
         extra = request.sampling_params.extra_args
         return bool(extra and extra.get("_beam_suppress_core_output"))
 
-    def _drain_logits_processor_group(self, group: BeamGroup, gr: Any) -> None:
-        if gr is None:
-            return
+    @staticmethod
+    def _beam_transitions_from_output(
+        model_runner_output: "ModelRunnerOutput",
+    ) -> dict[str, BeamTransition]:
+        custom_outputs = getattr(model_runner_output, "custom_outputs", None)
+        if not custom_outputs:
+            return {}
+        transitions = custom_outputs.get(_BEAM_TRANSITIONS_OUTPUT)
+        if not transitions:
+            return {}
+        return {transition.group_id: transition for transition in transitions}
 
-        for tokens, cum in gr.completions:
-            self._add_completion(group, tokens, cum)
-        gr.completions = []
-        self._finish_inactive_slots(group, gr)
+    def _drain_beam_transition(self, group: BeamGroup, transition: Any) -> None:
+        for tokens, cum in transition.completions:
+            self._add_completion(group, list(tokens), cum)
+        self._finish_inactive_slots(group, transition)
 
     def _should_finalize_group(
         self,
@@ -646,7 +702,8 @@ class BeamSearchScheduler(Scheduler):
             return True
 
         if gr is None:
-            return True
+            self._summary_stats.missing_runtime_waits += 1
+            return False
 
         if not active_slots:
             return True
@@ -694,6 +751,13 @@ class BeamSearchScheduler(Scheduler):
     def _active_slots(self, group: BeamGroup, gr: Any) -> list[int]:
         if gr is None:
             return list(range(group.beam_width))
+        active_slots = getattr(gr, "active_slots", None)
+        if active_slots is not None:
+            return [
+                slot
+                for slot in active_slots[:group.beam_width]
+                if slot not in group.finished_beam_indices
+            ]
         active = getattr(gr, "active", None)
         if active is None:
             return list(range(group.beam_width))
@@ -703,7 +767,11 @@ class BeamSearchScheduler(Scheduler):
             if is_active and slot not in group.finished_beam_indices
         ]
 
-    def _finish_inactive_slots(self, group: BeamGroup, gr: Any) -> None:
+    def _finish_inactive_slots(
+        self,
+        group: BeamGroup,
+        gr: Any,
+    ) -> None:
         inactive_slots = list(getattr(gr, "inactive_slots", []) or [])
         if not inactive_slots:
             return
@@ -720,7 +788,8 @@ class BeamSearchScheduler(Scheduler):
             group.finished_beam_indices.add(slot)
             self.beam_to_group.pop(child_id, None)
 
-        gr.inactive_slots = []
+        if hasattr(gr, "inactive_slots") and not hasattr(gr, "step_id"):
+            gr.inactive_slots = []
 
     def _apply_fork_plan(
         self,
@@ -729,6 +798,8 @@ class BeamSearchScheduler(Scheduler):
         active_slots: list[int],
     ) -> int:
         t0 = time.perf_counter() if _HOTPATH_TIMING else 0.0
+        if gr is None:
+            return 0
         rebases = self._fork_rebases(group, gr, active_slots)
         if not rebases:
             return 0
@@ -754,10 +825,10 @@ class BeamSearchScheduler(Scheduler):
     @staticmethod
     def _fork_rebases(
         group: BeamGroup,
-        gr: Any,
+        source: Any,
         active_slots: list[int],
     ) -> list[tuple[int, int]]:
-        fork_src = gr.fork_src
+        fork_src = source.fork_src
         active_slot_set = set(active_slots)
         return [
             (dst, fork_src[dst])
@@ -772,13 +843,13 @@ class BeamSearchScheduler(Scheduler):
     def _snapshot_fork_sources(
         self,
         group: BeamGroup,
-        gr: Any,
+        source: Any,
         rebases: list[tuple[int, int]],
         self_idxs: list[int],
         mgrs: Any,
     ) -> dict[int, _PrefixSnapshot]:
         snapshots: dict[int, _PrefixSnapshot] = {}
-        output_prefix_len = int(getattr(gr, "prefix_len", 0) or 0)
+        output_prefix_len = int(getattr(source, "prefix_len", 0) or 0)
 
         for _dst, src in rebases:
             if src in snapshots:
@@ -802,39 +873,27 @@ class BeamSearchScheduler(Scheduler):
         mgrs: Any,
     ) -> _PrefixSnapshot:
         # Snapshot every source's prefix blocks BEFORE mutating anything.
-        # Default mode shares only completed blocks and recomputes the partial
-        # suffix. VLLM_BEAM_COW uses copy-on-write for the partial block.
         blocks_by_manager: dict[int, list[Any]] = {}
-        cow_source_by_manager: dict[int, Any] = {}
         num_computed_tokens = 0
 
         for manager_index in self_idxs:
             blocks = list(mgrs[manager_index].req_to_blocks.get(src_id, []))
-            if _COW:
-                n_full_blocks = kv_prefix_len // self.block_size
-                has_partial_block = kv_prefix_len % self.block_size != 0
-                blocks_by_manager[manager_index] = blocks[:n_full_blocks]
-                if has_partial_block and len(blocks) > n_full_blocks:
-                    cow_source_by_manager[manager_index] = blocks[n_full_blocks]
-                num_computed_tokens = kv_prefix_len
-                continue
+            n_full_blocks = kv_prefix_len // self.block_size
+            shared_blocks = blocks[:n_full_blocks]
+            shareable_tokens = len(shared_blocks) * self.block_size
 
-            blocks_by_manager[manager_index] = blocks[:-1] if blocks else []
-            num_computed_tokens = max(
-                num_computed_tokens,
-                (len(blocks) - 1) * self.block_size,
-            )
+            blocks_by_manager[manager_index] = shared_blocks
+            num_computed_tokens = max(num_computed_tokens, shareable_tokens)
 
         return _PrefixSnapshot(
             num_computed_tokens=num_computed_tokens,
             blocks_by_manager=blocks_by_manager,
-            cow_source_by_manager=cow_source_by_manager,
         )
 
     def _rebase_slot(
         self,
         group: BeamGroup,
-        gr: Any,
+        source: Any,
         dst: int,
         src_snap: _PrefixSnapshot,
         self_idxs: list[int],
@@ -844,21 +903,11 @@ class BeamSearchScheduler(Scheduler):
         dst_id = group.beam_request_ids[dst]
         dst_req = group.beam_requests[dst]
         n_prefix = src_snap.num_computed_tokens
-        cow_plan = self._cow_plan(dst_req)
 
         for manager_index in self_idxs:
             mgr = mgrs[manager_index]
             shared_blocks = list(src_snap.blocks_by_manager[manager_index])
             new_blocks = list(shared_blocks)
-            cow_src = src_snap.cow_source_by_manager.get(manager_index)
-            if _COW and cow_src is not None and not getattr(cow_src, "is_null", False):
-                self._append_cow_block(
-                    mgr=mgr,
-                    cow_src=cow_src,
-                    cow_plan=cow_plan,
-                    new_blocks=new_blocks,
-                    block_pool=block_pool,
-                )
 
             self._replace_request_blocks(
                 mgr=mgr,
@@ -866,9 +915,10 @@ class BeamSearchScheduler(Scheduler):
                 shared_blocks=shared_blocks,
                 new_blocks=new_blocks,
                 block_pool=block_pool,
+                prefix_blocks=len(new_blocks),
             )
 
-        new_output = self._rewrite_rebased_request(dst_req, gr, dst, n_prefix)
+        new_output = self._rewrite_rebased_request(dst_req, source, dst, n_prefix)
         self.prev_step_scheduled_req_ids.discard(dst_id)
 
         if _DEBUG:
@@ -877,42 +927,24 @@ class BeamSearchScheduler(Scheduler):
                   flush=True)
 
     @staticmethod
-    def _cow_plan(dst_req: Request) -> list[tuple[int, int, int]]:
-        cow_plan = getattr(dst_req, "_beam_cow_blocks", None)
-        if cow_plan is None:
-            cow_plan = []
-            dst_req._beam_cow_blocks = cow_plan
-        return cow_plan
-
-    def _append_cow_block(
-        self,
-        mgr: Any,
-        cow_src: Any,
-        cow_plan: list[tuple[int, int, int]],
-        new_blocks: list[Any],
-        block_pool: Any,
-    ) -> None:
-        cow_dst = block_pool.get_new_blocks(1)[0]
-        new_blocks.append(cow_dst)
-        block_pool.touch([cow_src])
-        self._cow_release_blocks.append(cow_src)
-        cow_plan.append((mgr.kv_cache_group_id, cow_src.block_id, cow_dst.block_id))
-
-    @staticmethod
     def _replace_request_blocks(
         mgr: Any,
         dst_id: str,
         shared_blocks: list[Any],
         new_blocks: list[Any],
         block_pool: Any,
+        prefix_blocks: int,
     ) -> None:
         old_blocks = mgr.req_to_blocks.get(dst_id, [])
+        suffix_blocks = list(old_blocks[prefix_blocks:])
+        stale_prefix_blocks = list(old_blocks[:prefix_blocks])
+        new_blocks.extend(suffix_blocks)
         # Touch new prefix (ref++) before freeing old (ref--) so blocks
         # shared between them never transiently hit ref 0.
         if shared_blocks:
             block_pool.touch(shared_blocks)
-        if old_blocks:
-            block_pool.free_blocks(reversed(old_blocks))
+        if stale_prefix_blocks:
+            block_pool.free_blocks(reversed(stale_prefix_blocks))
         mgr.req_to_blocks[dst_id] = list(new_blocks)
         num_cached = getattr(mgr, "num_cached_block", None)
         if num_cached is not None:
@@ -938,7 +970,6 @@ class BeamSearchScheduler(Scheduler):
         if getattr(dst_req, "_block_hasher", None) is not None:
             dst_req.block_hashes = []
             dst_req.update_block_hashes()
-        dst_req._beam_history_rewrite_pending = True
         return new_output
 
     # ------------------------------------------------------------------
@@ -946,8 +977,12 @@ class BeamSearchScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def _finalize_group(
-        self, group: BeamGroup, outputs: dict[int, EngineCoreOutputs], gr: Any
+        self,
+        group: BeamGroup,
+        outputs: dict[int, EngineCoreOutputs],
+        gr: Any,
     ) -> None:
+        self._summary_stats.finalizes += 1
         if _TRACE:
             self._trace_final_candidates(group, gr)
 
@@ -955,18 +990,24 @@ class BeamSearchScheduler(Scheduler):
         if best is not None:
             final_tokens = self._tokens_with_eos(group, best.tokens)
             self._emit_parent_output(group, outputs, final_tokens, finish_reason)
+            self._summary_stats.parent_outputs += 1
             if _DEBUG:
                 print(f"[BEAM] finalize gid={group.orig_request_id} "
                       f"norm={group.normalized(best.cum_score, best.length):.3f} "
                       f"len={best.length} tokens={final_tokens[:20]}", flush=True)
         else:
+            self._summary_stats.no_best_finalizes += 1
             logger.warning("Beam group %s finalized with no beams.",
                            group.orig_request_id)
 
         self._finish_group_children(group)
         self._cleanup_group(group)
 
-    def _trace_final_candidates(self, group: BeamGroup, gr: Any) -> None:
+    def _trace_final_candidates(
+        self,
+        group: BeamGroup,
+        gr: Any,
+    ) -> None:
         for idx, beam in enumerate(group.completed):
             print(
                 f"[BEAM_TRACE plugin] final-completed idx={idx} "
@@ -985,10 +1026,11 @@ class BeamSearchScheduler(Scheduler):
             if not toks:
                 continue
             length = self._beam_length(group, toks)
+            cum = gr.cum[slot]
             print(
                 f"[BEAM_TRACE plugin] final-active slot={slot} "
-                f"cum={gr.cum[slot]:.6f} len={length} "
-                f"norm={group.normalized(gr.cum[slot], length):.6f} "
+                f"cum={cum:.6f} len={length} "
+                f"norm={group.normalized(cum, length):.6f} "
                 f"seq={toks}",
                 flush=True,
             )
@@ -1008,7 +1050,11 @@ class BeamSearchScheduler(Scheduler):
 
         return None, FinishReason.STOP
 
-    def _best_live_beam(self, group: BeamGroup, gr: Any) -> CompletedBeam | None:
+    def _best_live_beam(
+        self,
+        group: BeamGroup,
+        gr: Any,
+    ) -> CompletedBeam | None:
         if gr is None:
             return None
 
@@ -1071,30 +1117,14 @@ class BeamSearchScheduler(Scheduler):
         Scheduler.finish_requests(
             self, group.beam_request_ids, RequestStatus.FINISHED_STOPPED
         )
-
-    # ------------------------------------------------------------------
-    # LP bridge / bookkeeping
-    # ------------------------------------------------------------------
-
-    def _find_lp_runtime(self) -> dict[str, Any] | None:
-        runtime = getattr(builtins, _RUNTIME_ATTR, None)
-        if runtime is not None:
-            return runtime
-        from .logits_processor import BeamSearchLogitsProcessor
-
-        instance = getattr(BeamSearchLogitsProcessor, "_singleton", None)
-        if instance is None:
-            return None
-        return instance.groups
+        self._summary_stats.child_finishes += len(group.beam_request_ids)
 
     def _cleanup_group(self, group: BeamGroup) -> None:
         group.finalized = True
+        self._summary_stats.cleanups += 1
         for bid in group.beam_request_ids:
             self.beam_to_group.pop(bid, None)
         self.beam_groups.pop(group.orig_request_id, None)
-        lp_groups = self._find_lp_runtime()
-        if lp_groups is not None:
-            lp_groups.pop(group.orig_request_id, None)
 
     def get_num_unfinished_requests(self) -> int:
         return super().get_num_unfinished_requests() + len(self.beam_groups)
@@ -1103,4 +1133,4 @@ class BeamSearchScheduler(Scheduler):
         return super().has_requests() or bool(self.beam_groups)
 
 
-_install_history_rewrite_patches()
+_install_worker_history_rewrite_hooks()
