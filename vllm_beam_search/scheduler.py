@@ -570,7 +570,6 @@ class BeamSearchScheduler(Scheduler):
     ) -> None:
         for tokens, cum in transition.completions:
             self._add_completion(group, list(tokens), cum)
-        self._finish_inactive_slots(group, transition)
 
     def _should_finalize_group(
         self,
@@ -640,26 +639,6 @@ class BeamSearchScheduler(Scheduler):
             slot for slot in transition.active_slots[:group.beam_width]
             if slot not in group.finished_beam_indices
         ]
-
-    def _finish_inactive_slots(
-        self,
-        group: BeamGroup,
-        transition: BeamTransition,
-    ) -> None:
-        if not transition.inactive_slots:
-            return
-
-        for slot in transition.inactive_slots:
-            if slot in group.finished_beam_indices:
-                continue
-            if slot >= len(group.beam_request_ids):
-                continue
-            child_id = group.beam_request_ids[slot]
-            Scheduler.finish_requests(
-                self, child_id, RequestStatus.FINISHED_ABORTED
-            )
-            group.finished_beam_indices.add(slot)
-            self.beam_to_group.pop(child_id, None)
 
     def _apply_fork_plan(
         self,

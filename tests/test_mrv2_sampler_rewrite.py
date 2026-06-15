@@ -10,6 +10,7 @@ from vllm_beam_search.beam_types import _INIT_NEG, BeamRuntime
 from vllm_beam_search.mrv2_sampler import (
     AsyncBeamTransitions,
     BeamSearchMRV2Sampler,
+    _BeamGroupGpuState,
     _BeamGroupStatePool,
     _BeamTransitionsGpu,
     _TransitionBufferPool,
@@ -84,7 +85,6 @@ def _sampler() -> BeamSearchMRV2Sampler:
             eos_token_id=2,
             no_repeat_ngram_size=3,
             prompt_tokens=[0, 0],
-            active=[True, True],
         )
     }
     return sampler
@@ -97,22 +97,17 @@ def _pooled_state(
     cum: torch.Tensor,
     length: int,
     prompt_len: int = 0,
-) -> tuple[dict[str, object], torch.Tensor]:
+) -> tuple[_BeamGroupGpuState, torch.Tensor]:
     slot = pool.allocate()
     pool.tokens[slot].zero_()
     pool.tokens[slot, :, :tokens.shape[1]].copy_(tokens)
     pool.cum[slot].copy_(cum)
-    pool.active[slot].fill_(True)
-    state = {
-        "tokens": pool.tokens[slot],
-        "length": length,
-        "prompt_len": prompt_len,
-        "cum": pool.cum[slot],
-        "active": pool.active[slot],
-        "pool": pool,
-        "slot": slot,
-        "step": 0,
-    }
+    state = _BeamGroupGpuState(
+        pool=pool,
+        slot=slot,
+        length=length,
+        prompt_len=prompt_len,
+    )
     return state, pool.tokens[slot]
 
 
@@ -274,7 +269,6 @@ def test_gpu_worker_rewrite_batches_same_prefix_groups() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            active=[True, True],
         )
         for gid in ("g0", "g1")
     }
@@ -415,7 +409,7 @@ def test_pending_computed_reset_restores_prefix_after_postprocess() -> None:
     sampler = _sampler()
     sampler._pending_computed_resets.append((
         torch.tensor([0, 1], dtype=torch.long, device=DEVICE),
-        0,
+        torch.tensor([0, 0], dtype=torch.long, device=DEVICE),
     ))
     req_states = sampler.base_sampler.req_states
     req_states.num_computed_tokens.gpu[:] = torch.tensor(
@@ -440,7 +434,6 @@ def test_select_masks_padded_inactive_beams() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            active=[True, False, True, False],
         )
     }
     tokens_input = torch.tensor(
@@ -489,10 +482,12 @@ def test_select_masks_padded_inactive_beams() -> None:
         sampled=sampled,
     )
 
-    transition = transitions["gid"]
-    assert transition["dst_slots"].cpu().tolist() == [0, 2]
-    assert transition["src_slots"].cpu().tolist() == [2, 0]
-    assert transition["active_mask"].cpu().tolist() == [
+    assert transitions is not None
+    group_idx = transitions.gids.index("gid")
+    active_count = transitions.active_counts[group_idx]
+    assert transitions.dst_slots[group_idx, :active_count].cpu().tolist() == [0, 2]
+    assert transitions.src_slots[group_idx, :active_count].cpu().tolist() == [2, 0]
+    assert transitions.active_mask[group_idx].cpu().tolist() == [
         True,
         False,
         True,
@@ -521,7 +516,6 @@ def test_beam_view_reorders_interleaved_requests() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            active=[True, True],
         )
         for gid in ("g0", "g1")
     }
@@ -566,7 +560,6 @@ def test_select_handles_mixed_lengths_in_one_bucket() -> None:
             eos_token_id=None,
             no_repeat_ngram_size=2,
             prompt_tokens=[],
-            active=[True, True],
         )
         for gid in ("g0", "g1")
     }
@@ -634,7 +627,8 @@ def test_select_handles_mixed_lengths_in_one_bucket() -> None:
         sampled=sampled,
     )
 
-    assert set(transitions) == {"g0", "g1"}
+    assert transitions is not None
+    assert set(transitions.gids) == {"g0", "g1"}
     assert sampled.cpu().tolist() == [5, 6, 9, 10]
     assert tokens_g0[:, :2].cpu().tolist() == [[0, 5], [0, 6]]
     assert tokens_g1[:, :4].cpu().tolist() == [
@@ -666,7 +660,6 @@ def test_select_materializes_eos_completions() -> None:
             eos_token_id=2,
             no_repeat_ngram_size=0,
             prompt_tokens=[],
-            active=[True, True],
         )
         for gid in ("g0", "g1")
     }
@@ -725,18 +718,21 @@ def test_select_materializes_eos_completions() -> None:
         sampled=sampled,
     )
 
-    assert transitions["g0"]["completion_sequences"][0].cpu().tolist() == [
+    assert transitions is not None
+    g0_idx = transitions.gids.index("g0")
+    g1_idx = transitions.gids.index("g1")
+    assert transitions.completion_sequences[g0_idx, 0, :3].cpu().tolist() == [
         11,
         12,
         2,
     ]
-    assert transitions["g1"]["completion_sequences"][0].cpu().tolist() == [
+    assert transitions.completion_sequences[g1_idx, 0, :3].cpu().tolist() == [
         21,
         22,
         2,
     ]
-    assert transitions["g0"]["completion_scores"][0].item() > _INIT_NEG / 2
-    assert transitions["g1"]["completion_scores"][0].item() > _INIT_NEG / 2
+    assert transitions.completion_scores[g0_idx, 0].item() > _INIT_NEG / 2
+    assert transitions.completion_scores[g1_idx, 0].item() > _INIT_NEG / 2
 
     staged = AsyncBeamTransitions(transitions).to_cpu_nonblocking()
     torch.cuda.synchronize()

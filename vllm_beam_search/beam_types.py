@@ -15,7 +15,6 @@ class BeamTransition:
     tokens: tuple[tuple[int, ...], ...]
     cum: tuple[float, ...]
     completions: tuple[tuple[tuple[int, ...], float], ...] = ()
-    inactive_slots: tuple[int, ...] = ()
 
 
 @dataclass
@@ -24,4 +23,3 @@ class BeamRuntime:
     eos_token_id: int | None
     no_repeat_ngram_size: int = 0
     prompt_tokens: list[int] = field(default_factory=list)
-    active: list[bool] = field(default_factory=list)

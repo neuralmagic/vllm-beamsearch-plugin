@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os
@@ -24,7 +23,7 @@ from .beam_types import _INIT_NEG, BeamRuntime, BeamTransition
 BEAM_TRANSITIONS_OUTPUT = "vllm_beam_search.transitions"
 _SYNC_CHECK = os.getenv("VLLM_BEAM_GPU_SYNC_CHECK")
 _NEG_INF = float("-inf")
-_SelectEntry = tuple[str, BeamRuntime, dict[str, Any]]
+_GroupStateEntry = tuple[str, "_BeamGroupGpuState"]
 _SelectKey = tuple[int, int, int | None]
 _BeamRequest = tuple[int, str, int, BeamRuntime]
 _BEAM_IDX = 0
@@ -748,11 +747,6 @@ class _BeamGroupStatePool:
             dtype=torch.float32,
             device=device,
         )
-        self.active = torch.empty(
-            (self.capacity, beam_width),
-            dtype=torch.bool,
-            device=device,
-        )
         self._next_slot = 0
         self._free_slots: list[int] = []
 
@@ -783,8 +777,18 @@ class _BeamGroupStatePool:
             self.tokens[slot, :, :prompt_len] = prompt.unsqueeze(0)
         self.cum[slot].fill_(_INIT_NEG)
         self.cum[slot, 0:1].fill_(0.0)
-        self.active[slot].fill_(True)
         return prompt_len
+
+
+@dataclass
+class _BeamGroupGpuState:
+    """Per-group slot in the shared GPU beam state pool."""
+
+    pool: _BeamGroupStatePool
+    slot: int
+    length: int
+    prompt_len: int
+    step: int = 0
 
 
 @dataclass
@@ -810,47 +814,6 @@ class _BeamTransitionsGpu:
     def __bool__(self) -> bool:
         return bool(self.gids)
 
-    def __iter__(self) -> Iterable[str]:
-        return iter(self.gids)
-
-    def __getitem__(self, gid: str) -> dict[str, Any]:
-        return self._transition_view(self.gids.index(gid))
-
-    def items(self) -> Iterable[tuple[str, dict[str, Any]]]:
-        for group_idx, gid in enumerate(self.gids):
-            yield gid, self._transition_view(group_idx)
-
-    def _transition_view(self, group_idx: int) -> dict[str, Any]:
-        active_count = self.active_counts[group_idx]
-        completion_sequences = self.completion_sequences
-        if completion_sequences is not None and self.completion_lens:
-            completion_sequences = completion_sequences[
-                group_idx,
-                :,
-                : self.completion_lens[group_idx],
-            ]
-        elif completion_sequences is not None:
-            completion_sequences = completion_sequences[group_idx]
-
-        completion_scores = self.completion_scores
-        if completion_scores is not None:
-            completion_scores = completion_scores[group_idx]
-
-        return {
-            "gid": self.gids[group_idx],
-            "step": self.steps[group_idx],
-            "prefix_len": self.prefix_lens[group_idx],
-            "prompt_len": self.prompt_lens[group_idx],
-            "dst_slots": self.dst_slots[group_idx, :active_count],
-            "src_slots": self.src_slots[group_idx, :active_count],
-            "fork_src": self.fork_src[group_idx],
-            "active_mask": self.active_mask[group_idx],
-            "tokens": self.tokens[group_idx],
-            "cum": self.cum[group_idx],
-            "completion_scores": completion_scores,
-            "completion_sequences": completion_sequences,
-        }
-
     def async_tensors(self) -> dict[str, torch.Tensor | None]:
         """Return only tensors needed by scheduler finalization."""
         return {
@@ -865,7 +828,7 @@ class _BeamTransitionsGpu:
 
 def _rewrite_beam_states(
     *,
-    entries: list[_SelectEntry],
+    group_count: int,
     pool: _BeamGroupStatePool,
     state_slots_by_group: torch.Tensor,
     lengths_cpu: list[int],
@@ -883,7 +846,6 @@ def _rewrite_beam_states(
 ]:
     """Rewrite shared-pool beam state with fixed sampler launch count."""
     device = sampled.device
-    group_count = len(entries)
     max_length = max(lengths_cpu)
     lengths = _copy_cpu_values_to_gpu(
         lengths_cpu,
@@ -1011,7 +973,7 @@ def _snapshot_transition_state(
 
 def _build_completion_tensors(
     *,
-    entries: list[_SelectEntry],
+    group_count: int,
     pool: _BeamGroupStatePool,
     state_slots_by_group: torch.Tensor,
     lengths_cpu: list[int],
@@ -1021,7 +983,6 @@ def _build_completion_tensors(
     completion_scores: torch.Tensor | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple[int, ...]]:
     """Materialize EOS candidate sequences without per-group copy kernels."""
-    group_count = len(entries)
     completion_lens = tuple(
         length - prompt_len + 1
         for length, prompt_len in zip(lengths_cpu, prompt_lens_cpu)
@@ -1119,9 +1080,9 @@ class BeamSearchMRV2Sampler:
         self.kv_cache_config: Any | None = None
         self.kv_cache_forward_context: dict[str, Any] | None = None
         self._pending_computed_resets: list[
-            tuple[torch.Tensor, int | torch.Tensor]
+            tuple[torch.Tensor, torch.Tensor]
         ] = []
-        self._gpu_group_state: dict[str, dict[str, Any]] = {}
+        self._gpu_group_state: dict[str, _BeamGroupGpuState] = {}
         self._gpu_state_pools: dict[int, _BeamGroupStatePool] = {}
         self._transition_buffer_pool = _TransitionBufferPool()
 
@@ -1180,7 +1141,6 @@ class BeamSearchMRV2Sampler:
                 eos_token_id=int(eos) if eos is not None else None,
                 no_repeat_ngram_size=no_repeat,
                 prompt_tokens=list(prompt_token_ids or []),
-                active=[True] * beam_width,
             )
             self.groups[gid] = gr
             self._init_gpu_group_state(gid, gr)
@@ -1193,16 +1153,12 @@ class BeamSearchMRV2Sampler:
         pool = self._get_gpu_state_pool(gr.beam_width)
         slot = pool.allocate()
         prompt_len = pool.initialize(slot, gr.prompt_tokens)
-        self._gpu_group_state[gid] = {
-            "tokens": pool.tokens[slot],
-            "length": prompt_len,
-            "prompt_len": prompt_len,
-            "cum": pool.cum[slot],
-            "active": pool.active[slot],
-            "pool": pool,
-            "slot": slot,
-            "step": 0,
-        }
+        self._gpu_group_state[gid] = _BeamGroupGpuState(
+            pool=pool,
+            slot=slot,
+            length=prompt_len,
+            prompt_len=prompt_len,
+        )
 
     def _get_gpu_state_pool(self, beam_width: int) -> _BeamGroupStatePool:
         pool = self._gpu_state_pools.get(beam_width)
@@ -1228,7 +1184,7 @@ class BeamSearchMRV2Sampler:
             self.groups.pop(gid, None)
             state = self._gpu_group_state.pop(gid, None)
             if state is not None:
-                state["pool"].release(int(state["slot"]))
+                state.pool.release(state.slot)
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         if not self._has_beam_requests(input_batch):
@@ -1333,31 +1289,19 @@ class BeamSearchMRV2Sampler:
             input_batch,
             processed_logits.shape[0],
         )
-        key, entries = self._collect_select_entries(beam_view)
+        key, group_states = self._collect_group_states(beam_view)
         if key is None:
             return None
 
         bw, no_repeat, eos = key
         device = processed_logits.device
-        group_count = len(entries)
-        lengths_cpu = [
-            int(state["length"])
-            for _gid, _gr, state in entries
-        ]
-        prompt_lens_cpu = [
-            int(state["prompt_len"])
-            for _gid, _gr, state in entries
-        ]
-        pools = {
-            state["pool"]
-            for _gid, _gr, state in entries
-        }
+        group_count = len(group_states)
+        lengths_cpu = [state.length for _gid, state in group_states]
+        prompt_lens_cpu = [state.prompt_len for _gid, state in group_states]
+        pools = {state.pool for _gid, state in group_states}
         assert len(pools) == 1
         pool = pools.pop()
-        state_slots_cpu = [
-            int(state["slot"])
-            for _gid, _gr, state in entries
-        ]
+        state_slots_cpu = [state.slot for _gid, state in group_states]
         max_length = max(lengths_cpu)
         beam_metadata = _copy_cpu_tensor_to_gpu(
             beam_view.beam_metadata_cpu,
@@ -1458,7 +1402,7 @@ class BeamSearchMRV2Sampler:
             completion_scores,
             completion_lens,
         ) = _build_completion_tensors(
-            entries=entries,
+            group_count=group_count,
             pool=pool,
             state_slots_by_group=state_slots_by_group,
             lengths_cpu=lengths_cpu,
@@ -1472,7 +1416,7 @@ class BeamSearchMRV2Sampler:
             fork_src_by_group,
             active_mask_by_group,
         ) = _rewrite_beam_states(
-            entries=entries,
+            group_count=group_count,
             pool=pool,
             state_slots_by_group=state_slots_by_group,
             lengths_cpu=lengths_cpu,
@@ -1495,12 +1439,12 @@ class BeamSearchMRV2Sampler:
 
         gids: list[str] = []
         steps: list[int] = []
-        for group_idx, (gid, _gr, state) in enumerate(entries):
+        for group_idx, (gid, state) in enumerate(group_states):
             length = lengths_cpu[group_idx]
             gids.append(gid)
-            steps.append(int(state["step"]))
-            state["length"] = length + 1
-            state["step"] = int(state["step"]) + 1
+            steps.append(state.step)
+            state.length = length + 1
+            state.step += 1
 
         return _BeamTransitionsGpu(
             gids=tuple(gids),
@@ -1520,15 +1464,15 @@ class BeamSearchMRV2Sampler:
             completion_lens=completion_lens,
         )
 
-    def _collect_select_entries(
+    def _collect_group_states(
         self,
         beam_view: _BeamView,
-    ) -> tuple[_SelectKey | None, list[_SelectEntry]]:
+    ) -> tuple[_SelectKey | None, list[_GroupStateEntry]]:
         """Collect one homogeneous selection group for the MRV2 beam path."""
         key = beam_view.key
-        entries: list[_SelectEntry] = []
+        group_states: list[_GroupStateEntry] = []
         if key is None:
-            return None, entries
+            return None, group_states
         for gid in beam_view.gids:
             gr = self.groups.get(gid)
             if gr is None:
@@ -1537,8 +1481,8 @@ class BeamSearchMRV2Sampler:
             if state is None:
                 self._init_gpu_group_state(gid, gr)
                 state = self._gpu_group_state[gid]
-            entries.append((gid, gr, state))
-        return key, entries
+            group_states.append((gid, state))
+        return key, group_states
 
     def _beam_view_by_group(
         self,
@@ -1571,21 +1515,12 @@ class BeamSearchMRV2Sampler:
             dtype=np.int64,
             count=len(beam_requests),
         )
-        active_np = np.fromiter(
-            (
-                not request[3].active or request[3].active[request[2]]
-                for request in beam_requests
-            ),
-            dtype=np.bool_,
-            count=len(beam_requests),
-        )
         cu_num_logits = input_batch.cu_num_logits_np
         cu_start = cu_num_logits[batch_idx_np]
         cu_end = cu_num_logits[batch_idx_np + 1]
         logit_idx_np = cu_end - 1
         valid_np = (
-            active_np
-            & (cu_end > cu_start)
+            (cu_end > cu_start)
             & (logit_idx_np >= 0)
             & (logit_idx_np < num_logits)
         )
@@ -1940,9 +1875,6 @@ class BeamSearchMRV2Sampler:
             return
         num_computed = self.base_sampler.req_states.num_computed_tokens.gpu
         for req_idx, prefix_len in self._pending_computed_resets:
-            if isinstance(prefix_len, int):
-                num_computed.index_fill_(0, req_idx, prefix_len)
-                continue
             n_items = req_idx.numel()
             block_n = 256
             _set_num_computed_kernel[(triton.cdiv(n_items, block_n),)](
@@ -2151,5 +2083,4 @@ def _materialize_transition(data: dict[str, Any]) -> BeamTransition:
         tokens=tuple(generated),
         cum=cum,
         completions=tuple(completions),
-        inactive_slots=(),
     )
