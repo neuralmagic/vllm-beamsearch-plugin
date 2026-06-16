@@ -47,7 +47,130 @@ logger = init_logger(__name__)
 
 def _install_worker_history_rewrite_hooks() -> None:
     _patch_flash_attn_hopper_block_size_one()
+    _patch_mrv2_model_state_beam_sampler()
     _patch_mrv2_gpu_model_runner_history_rewrites()
+
+
+def _is_beam_scheduler_config(vllm_config: Any) -> bool:
+    scheduler_cls = getattr(vllm_config.scheduler_config, "scheduler_cls", None)
+    if scheduler_cls is None:
+        return False
+    if isinstance(scheduler_cls, str):
+        return scheduler_cls == "vllm_beam_search.scheduler.BeamSearchScheduler"
+    return (
+        getattr(scheduler_cls, "__module__", None) == __name__
+        and getattr(scheduler_cls, "__qualname__", "") == "BeamSearchScheduler"
+    )
+
+
+def _patch_mrv2_model_state_beam_sampler() -> None:
+    """Install the beam sampler on any MRV2 model state using BeamScheduler."""
+    try:
+        import vllm.v1.worker.gpu.model_runner as model_runner_module
+        import vllm.v1.worker.gpu.model_states as model_states_module
+    except ImportError:
+        return
+
+    if getattr(model_runner_module, "_vllm_beam_model_state_patched", False):
+        return
+
+    original_init_model_state = model_runner_module.init_model_state
+
+    def patched_init_model_state(vllm_config, model, encoder_cache, device):
+        model_state = original_init_model_state(
+            vllm_config,
+            model,
+            encoder_cache,
+            device,
+        )
+        _attach_beam_sampler_to_model_state(model_state, vllm_config, device)
+        return model_state
+
+    model_runner_module.init_model_state = patched_init_model_state
+    model_states_module.init_model_state = patched_init_model_state
+    model_runner_module._vllm_beam_model_state_patched = True
+
+
+def _attach_beam_sampler_to_model_state(
+    model_state: Any,
+    vllm_config: Any,
+    device: Any,
+) -> None:
+    if getattr(model_state, "_vllm_beam_sampler_patched", False):
+        return
+    if not _is_beam_scheduler_config(vllm_config):
+        return
+
+    original_add_request = model_state.add_request
+    original_remove_request = model_state.remove_request
+    original_custom_sampler = model_state.custom_sampler
+    original_postprocess_state = model_state.postprocess_state
+
+    def custom_sampler(sampler: Any) -> tuple[Any, Any] | None:
+        custom = original_custom_sampler(sampler)
+        rejection_sampler = None
+        if custom is not None:
+            sampler, rejection_sampler = custom
+
+        from vllm_beam_search.mrv2_sampler import BeamSearchMRV2Sampler
+
+        beam_sampler = BeamSearchMRV2Sampler(sampler, vllm_config, device)
+        setattr(model_state, "_vllm_beam_sampler", beam_sampler)
+        _configure_beam_sampler_from_model_state(model_state, beam_sampler)
+        return beam_sampler, rejection_sampler
+
+    def add_request(req_index: int, new_req_data: Any) -> None:
+        original_add_request(req_index, new_req_data)
+        beam_sampler = getattr(model_state, "_vllm_beam_sampler", None)
+        if beam_sampler is None:
+            return
+        prompt_token_ids = (
+            new_req_data.prefill_token_ids
+            if new_req_data.prefill_token_ids is not None
+            else new_req_data.prompt_token_ids
+        )
+        beam_sampler.register_request(
+            new_req_data.req_id,
+            new_req_data.sampling_params,
+            prompt_token_ids,
+        )
+
+    def remove_request(req_id: str) -> None:
+        original_remove_request(req_id)
+        beam_sampler = getattr(model_state, "_vllm_beam_sampler", None)
+        if beam_sampler is not None:
+            beam_sampler.remove_request(req_id)
+
+    def postprocess_state(idx_mapping: Any, num_sampled: Any) -> None:
+        original_postprocess_state(idx_mapping, num_sampled)
+        beam_sampler = getattr(model_state, "_vllm_beam_sampler", None)
+        if beam_sampler is not None:
+            beam_sampler.apply_pending_rewrites()
+
+    model_state.custom_sampler = custom_sampler
+    model_state.add_request = add_request
+    model_state.remove_request = remove_request
+    model_state.postprocess_state = postprocess_state
+    model_state._vllm_beam_sampler_patched = True
+
+
+def _configure_beam_sampler_from_model_state(
+    model_state: Any,
+    beam_sampler: Any | None = None,
+) -> None:
+    beam_sampler = beam_sampler or getattr(model_state, "_vllm_beam_sampler", None)
+    if beam_sampler is None:
+        return
+
+    block_tables = getattr(model_state, "_vllm_beam_block_tables", None)
+    self_attn_groups = getattr(model_state, "_vllm_beam_self_attn_groups", ())
+    if block_tables is not None:
+        beam_sampler.set_block_tables(block_tables, self_attn_groups)
+
+    kv_cache_config = getattr(model_state, "_vllm_beam_kv_cache_config", None)
+    forward_context = getattr(model_state, "_vllm_beam_forward_context", None)
+    if kv_cache_config is not None and forward_context is not None:
+        beam_sampler.set_kv_caches(kv_cache_config, forward_context)
 
 
 def _flash_attn_hopper_block_size_one_enabled() -> bool:
@@ -149,15 +272,7 @@ def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
             "_vllm_beam_forward_context",
             self.compilation_config.static_forward_context,
         )
-
-        beam_sampler = getattr(model_state, "beam_sampler", None)
-        if beam_sampler is not None and hasattr(beam_sampler, "set_block_tables"):
-            beam_sampler.set_block_tables(block_tables, self_attn_groups)
-        if beam_sampler is not None and hasattr(beam_sampler, "set_kv_caches"):
-            beam_sampler.set_kv_caches(
-                self.kv_cache_config,
-                self.compilation_config.static_forward_context,
-            )
+        _configure_beam_sampler_from_model_state(model_state)
 
     def patched_initialize_kv_cache(self, kv_cache_config):
         original_initialize_kv_cache(self, kv_cache_config)
