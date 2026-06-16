@@ -35,7 +35,7 @@ class BeamGroup:
     orig_request: Request
     beam_width: int
 
-    # Sampling-time params mirrored from the logits processor.
+    # Sampling-time params mirrored from the public request.
     length_penalty: float = 1.0
 
     beam_request_ids: list[str] = field(default_factory=list)

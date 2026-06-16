@@ -1149,14 +1149,6 @@ class BeamSearchMRV2Sampler:
     def _has_beam_requests(self, input_batch: InputBatch) -> bool:
         return any(req_id in self.req_to_group for req_id in input_batch.req_ids)
 
-    @staticmethod
-    def _request_will_sample(input_batch: InputBatch, batch_idx: int) -> bool:
-        """Return whether this request has a logits entry this scheduler step."""
-        return (
-            int(input_batch.cu_num_logits_np[batch_idx + 1])
-            > int(input_batch.cu_num_logits_np[batch_idx])
-        )
-
     def _sample_with_beam_logits(
         self,
         logits: torch.Tensor,
@@ -2004,7 +1996,6 @@ def _materialize_transition(data: dict[str, Any]) -> BeamTransition:
 
     completions: list[tuple[tuple[int, ...], float]] = []
     completion_scores = data.get("completion_scores")
-    completion_sequences = data.get("completion_sequences")
     completion_prefixes = data.get("completion_prefixes")
     completion_slots = data.get("completion_slots")
     completion_tokens = data.get("completion_tokens")
@@ -2012,23 +2003,12 @@ def _materialize_transition(data: dict[str, Any]) -> BeamTransition:
         completion_scores is not None
         and completion_scores.numel() > 0
     ):
-        scores = completion_scores.tolist()
-        if completion_sequences is not None:
-            sequences = completion_sequences.tolist()
-            completion_len = data.get("completion_len")
-            for seq, score in zip(sequences, scores):
-                if score <= _INIT_NEG / 2:
-                    continue
-                if completion_len is not None:
-                    seq = seq[: int(completion_len)]
-                completions.append(
-                    (tuple(int(tok) for tok in seq), float(score))
-                )
-        elif (
+        if (
             completion_prefixes is not None
             and completion_slots is not None
             and completion_tokens is not None
         ):
+            scores = completion_scores.tolist()
             slots = completion_slots.tolist()
             tokens = completion_tokens.tolist()
             for slot, token, score in zip(slots, tokens, scores):
