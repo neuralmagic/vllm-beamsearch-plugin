@@ -29,14 +29,18 @@ uv pip install -e '/home/LucasWilkinson/local/vllm-beamsearch-plugin[stress]'
 ## Server
 
 ```bash
+MODEL=${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}
+SERVED_MODEL=${SERVED_MODEL:-llama3-8b}
+
 CUDA_VISIBLE_DEVICES=0 \
+HF_HUB_CACHE=${HF_HUB_CACHE:-/mnt/data/engine/hub_cache} \
 VLLM_USE_V2_MODEL_RUNNER=1 \
 VLLM_USE_FLASHINFER_SAMPLER=0 \
-PYTHONPATH=/home/LucasWilkinson/local/bart-plugin:/home/LucasWilkinson/local/vllm-beamsearch-plugin:${PYTHONPATH:-} \
+PYTHONPATH=/home/LucasWilkinson/local/vllm-beamsearch-plugin:${PYTHONPATH:-} \
 /home/LucasWilkinson/local/vllm/.venv/bin/python -m vllm.entrypoints.openai.api_server \
-  --model /home/LucasWilkinson/BArtfiles/bart/1/bart-large \
-  --served-model-name bart \
-  --dtype float16 \
+  --model "${MODEL}" \
+  --served-model-name "${SERVED_MODEL}" \
+  --dtype bfloat16 \
   --port 8005 \
   --block-size 16 \
   --no-enable-prefix-caching \
@@ -54,9 +58,9 @@ PYTHONPATH=/home/LucasWilkinson/local/bart-plugin:/home/LucasWilkinson/local/vll
 
 ```json
 {
-  "model": "bart",
-  "prompt": "Example input text",
-  "max_tokens": 300,
+  "model": "llama3-8b",
+  "prompt": "Write a concise summary of why beam search is useful:",
+  "max_tokens": 128,
   "temperature": 0,
   "add_special_tokens": false,
   "vllm_xargs": {
@@ -80,6 +84,7 @@ Run sustained stress plus memory sampling against a running server:
 ```bash
 vllm-beam-stress \
   --base-url http://localhost:8005 \
+  --model llama3-8b \
   --rounds 100 \
   --requests-per-round 32 \
   --concurrency 64 \

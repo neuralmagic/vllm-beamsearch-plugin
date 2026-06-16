@@ -254,7 +254,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8005")
     parser.add_argument("--port", type=int, default=8005)
-    parser.add_argument("--model", default="bart")
+    parser.add_argument("--model", default="llama3-8b")
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--requests-per-round", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=64)
