@@ -721,16 +721,16 @@ def test_select_materializes_eos_completions() -> None:
     assert transitions is not None
     g0_idx = transitions.gids.index("g0")
     g1_idx = transitions.gids.index("g1")
-    assert transitions.completion_sequences[g0_idx, 0, :3].cpu().tolist() == [
+    assert transitions.completion_prefixes[g0_idx, 0, 1:3].cpu().tolist() == [
         11,
         12,
-        2,
     ]
-    assert transitions.completion_sequences[g1_idx, 0, :3].cpu().tolist() == [
+    assert transitions.completion_prefixes[g1_idx, 0, 1:3].cpu().tolist() == [
         21,
         22,
-        2,
     ]
+    assert transitions.completion_tokens[g0_idx, 0].item() == 2
+    assert transitions.completion_tokens[g1_idx, 0].item() == 2
     assert transitions.completion_scores[g0_idx, 0].item() > _INIT_NEG / 2
     assert transitions.completion_scores[g1_idx, 0].item() > _INIT_NEG / 2
 

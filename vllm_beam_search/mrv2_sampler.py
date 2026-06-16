@@ -31,6 +31,7 @@ _LOGIT_IDX = 1
 _INPUT_BATCH_IDX = 2
 _REQ_IDX = 3
 _NUM_SLOT_INDEX_FIELDS = 4
+_BEAM_STATE_BLOCK_N = 256
 
 
 @dataclass
@@ -155,6 +156,7 @@ def _snapshot_beam_prefix_kernel(
     token_pool,
     token_prefix,
     src_slots,
+    valid_beam_mask,
     state_slots,
     lengths,
     beam_width: tl.constexpr,
@@ -175,6 +177,7 @@ def _snapshot_beam_prefix_kernel(
     state_slot = tl.load(state_slots + group)
     length = tl.load(lengths + group)
     src_slot = tl.load(src_slots + group * src_stride0 + row * src_stride1)
+    valid = tl.load(valid_beam_mask + group * beam_width + row)
 
     prefix_mask = offsets < length
     prefix_vals = tl.load(
@@ -188,10 +191,10 @@ def _snapshot_beam_prefix_kernel(
     tl.store(
         token_prefix
         + group * prefix_stride0
-        + row * prefix_stride1
+        + src_slot * prefix_stride1
         + offsets * prefix_stride2,
         prefix_vals,
-        mask=prefix_mask,
+        mask=valid & prefix_mask,
     )
 
 
@@ -589,7 +592,9 @@ def _beam_state_rewrite_kernel(
     lengths,
     valid_beam_mask,
     beam_width: tl.constexpr,
-    prefix_width: tl.constexpr,
+    prefix_stride0,
+    prefix_stride1,
+    prefix_stride2,
     token_width: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ) -> None:
@@ -607,7 +612,10 @@ def _beam_state_rewrite_kernel(
 
     prefix_mask = offsets < length
     prefix_vals = tl.load(
-        token_prefix + group_slot * prefix_width + offsets,
+        token_prefix
+        + group * prefix_stride0
+        + src_slot * prefix_stride1
+        + offsets * prefix_stride2,
         mask=valid & prefix_mask,
         other=0,
     )
@@ -808,7 +816,9 @@ class _BeamTransitionsGpu:
     cum: torch.Tensor
     req_idx_by_group: torch.Tensor | None = None
     completion_scores: torch.Tensor | None = None
-    completion_sequences: torch.Tensor | None = None
+    completion_slots: torch.Tensor | None = None
+    completion_tokens: torch.Tensor | None = None
+    completion_prefixes: torch.Tensor | None = None
     completion_lens: tuple[int, ...] = ()
 
     def __bool__(self) -> bool:
@@ -822,7 +832,9 @@ class _BeamTransitionsGpu:
             "tokens": self.tokens,
             "cum": self.cum,
             "completion_scores": self.completion_scores,
-            "completion_sequences": self.completion_sequences,
+            "completion_slots": self.completion_slots,
+            "completion_tokens": self.completion_tokens,
+            "completion_prefixes": self.completion_prefixes,
         }
 
 
@@ -832,9 +844,11 @@ def _rewrite_beam_states(
     pool: _BeamGroupStatePool,
     state_slots_by_group: torch.Tensor,
     lengths_cpu: list[int],
+    lengths: torch.Tensor,
     sampled: torch.Tensor,
     slot_to_batch: torch.Tensor,
     valid_beam_mask: torch.Tensor,
+    snapshot_slots_by_group: torch.Tensor,
     dst_slots_by_group: torch.Tensor,
     src_slots_by_group: torch.Tensor,
     selected_tokens_by_group: torch.Tensor,
@@ -843,15 +857,11 @@ def _rewrite_beam_states(
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
     """Rewrite shared-pool beam state with fixed sampler launch count."""
     device = sampled.device
     max_length = max(lengths_cpu)
-    lengths = _copy_cpu_values_to_gpu(
-        lengths_cpu,
-        dtype=torch.long,
-        device=device,
-    )
     token_prefix = torch.empty(
         (group_count, beam_width, max_length),
         dtype=pool.tokens.dtype,
@@ -868,12 +878,13 @@ def _rewrite_beam_states(
         device=device,
     )
 
-    block_n = min(triton.next_power_of_2(max(max_length, 1)), 1024)
+    block_n = _BEAM_STATE_BLOCK_N
     prefix_grid = (group_count, beam_width, triton.cdiv(max_length, block_n))
     _snapshot_beam_prefix_kernel[prefix_grid](
         pool.tokens,
         token_prefix,
-        src_slots_by_group,
+        snapshot_slots_by_group,
+        valid_beam_mask,
         state_slots_by_group,
         lengths,
         beam_width,
@@ -900,7 +911,7 @@ def _rewrite_beam_states(
     )
 
     n_cols = max_length + 1
-    block_n = min(triton.next_power_of_2(n_cols), 1024)
+    block_n = _BEAM_STATE_BLOCK_N
     rewrite_grid = (group_count, beam_width, triton.cdiv(n_cols, block_n))
     selected_tokens = selected_tokens_by_group.to(torch.int64)
     _beam_state_rewrite_kernel[rewrite_grid](
@@ -919,11 +930,13 @@ def _rewrite_beam_states(
         lengths,
         valid_beam_mask,
         beam_width,
-        prefix_width=max_length,
+        token_prefix.stride(0),
+        token_prefix.stride(1),
+        token_prefix.stride(2),
         token_width=pool.max_len,
         BLOCK_N=block_n,
     )
-    return fork_src, active_mask
+    return fork_src, active_mask, token_prefix
 
 
 def _snapshot_transition_state(
@@ -946,7 +959,7 @@ def _snapshot_transition_state(
         dtype=pool.cum.dtype,
         device=pool.cum.device,
     )
-    block_n = min(triton.next_power_of_2(max_length + 1), 1024)
+    block_n = _BEAM_STATE_BLOCK_N
     grid = (group_count, beam_width, triton.cdiv(max_length + 1, block_n))
     _snapshot_transition_state_kernel[grid](
         pool.tokens,
@@ -971,75 +984,15 @@ def _snapshot_transition_state(
     return tokens, cum
 
 
-def _build_completion_tensors(
-    *,
-    group_count: int,
-    pool: _BeamGroupStatePool,
-    state_slots_by_group: torch.Tensor,
+def _completion_lens(
     lengths_cpu: list[int],
     prompt_lens_cpu: list[int],
-    completion_slots: torch.Tensor | None,
-    completion_tokens: torch.Tensor | None,
-    completion_scores: torch.Tensor | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple[int, ...]]:
-    """Materialize EOS candidate sequences without per-group copy kernels."""
-    completion_lens = tuple(
+) -> tuple[int, ...]:
+    """Return generated EOS candidate lengths by group."""
+    return tuple(
         length - prompt_len + 1
         for length, prompt_len in zip(lengths_cpu, prompt_lens_cpu)
     )
-    if (
-        completion_slots is None
-        or completion_tokens is None
-        or completion_scores is None
-    ):
-        return None, None, completion_lens
-
-    device = completion_slots.device
-    max_completion_len = max(completion_lens)
-    sequences = torch.zeros(
-        (
-            group_count,
-            completion_tokens.shape[1],
-            max_completion_len,
-        ),
-        dtype=pool.tokens.dtype,
-        device=device,
-    )
-    groups_by_shape: dict[tuple[int, int], list[int]] = {}
-    for group_idx, (length, prompt_len) in enumerate(
-        zip(lengths_cpu, prompt_lens_cpu)
-    ):
-        groups_by_shape.setdefault((length, prompt_len), []).append(group_idx)
-
-    for (length, prompt_len), group_indices_cpu in groups_by_shape.items():
-        group_indices = _copy_cpu_values_to_gpu(
-            group_indices_cpu,
-            dtype=torch.long,
-            device=device,
-        )
-        state_slots = state_slots_by_group[group_indices]
-        slots = completion_slots[group_indices]
-        tokens = completion_tokens[group_indices].to(pool.tokens.dtype)
-        generated_len = length - prompt_len
-        completion_len = generated_len + 1
-        if generated_len > 0:
-            cols = torch.arange(
-                prompt_len,
-                length,
-                dtype=torch.long,
-                device=device,
-            )
-            prefix = pool.tokens[
-                state_slots[:, None, None],
-                slots[:, :, None],
-                cols[None, None, :],
-            ]
-            local_sequences = torch.cat((prefix, tokens.unsqueeze(-1)), dim=2)
-        else:
-            local_sequences = tokens.unsqueeze(-1)
-        sequences[group_indices, :, :completion_len] = local_sequences
-
-    return sequences, completion_scores, completion_lens
 
 
 @contextmanager
@@ -1397,32 +1350,25 @@ class BeamSearchMRV2Sampler:
         selected_tokens_by_group = ids.reshape(group_count, -1).gather(1, flat_idx)
         dst_slots_by_group = beam_indices[:, :bw]
 
-        (
-            completion_sequences,
-            completion_scores,
-            completion_lens,
-        ) = _build_completion_tensors(
-            group_count=group_count,
-            pool=pool,
-            state_slots_by_group=state_slots_by_group,
+        completion_lens = _completion_lens(
             lengths_cpu=lengths_cpu,
             prompt_lens_cpu=prompt_lens_cpu,
-            completion_slots=completion_slots,
-            completion_tokens=completion_tokens,
-            completion_scores=eos_completion_scores,
         )
 
         (
             fork_src_by_group,
             active_mask_by_group,
+            completion_prefixes,
         ) = _rewrite_beam_states(
             group_count=group_count,
             pool=pool,
             state_slots_by_group=state_slots_by_group,
             lengths_cpu=lengths_cpu,
+            lengths=lengths,
             sampled=sampled,
             slot_to_batch=slot_to_batch,
             valid_beam_mask=valid_beam_mask,
+            snapshot_slots_by_group=beam_indices,
             dst_slots_by_group=dst_slots_by_group,
             src_slots_by_group=src_slots_by_group,
             selected_tokens_by_group=selected_tokens_by_group,
@@ -1459,8 +1405,12 @@ class BeamSearchMRV2Sampler:
             active_mask=active_mask_by_group,
             tokens=transition_tokens,
             cum=transition_cum,
-            completion_scores=completion_scores,
-            completion_sequences=completion_sequences,
+            completion_scores=eos_completion_scores,
+            completion_slots=completion_slots,
+            completion_tokens=completion_tokens,
+            completion_prefixes=(
+                completion_prefixes if eos_completion_scores is not None else None
+            ),
             completion_lens=completion_lens,
         )
 
@@ -1581,14 +1531,13 @@ class BeamSearchMRV2Sampler:
         valid_batch_idx_np = batch_idx_np[valid_beam_entries_np]
         valid_req_idx_np = req_idx_np[valid_beam_entries_np]
 
-        compact_order_np = np.lexsort((valid_slot_pos_np, valid_group_idx_np))
         active_slot_counts_np = np.bincount(
             valid_group_idx_np,
             minlength=group_count,
         )
-        valid_beam_mask_np = (
-            np.arange(beam_width, dtype=np.int64)[None, :]
-            < active_slot_counts_np[:, None]
+        valid_beam_mask_np = np.zeros(
+            (group_count, beam_width),
+            dtype=np.bool_,
         )
         beam_idx_by_slot_np = np.broadcast_to(
             beam_idx_np[padding_request_pos_np, None],
@@ -1598,12 +1547,13 @@ class BeamSearchMRV2Sampler:
             logit_idx_np[padding_request_pos_np, None],
             (group_count, beam_width),
         ).copy()
-        beam_idx_by_slot_np[valid_beam_mask_np] = valid_beam_idx_np[
-            compact_order_np
-        ]
-        logit_idx_by_slot_np[valid_beam_mask_np] = valid_logit_idx_np[
-            compact_order_np
-        ]
+        valid_beam_mask_np[valid_group_idx_np, valid_slot_pos_np] = True
+        beam_idx_by_slot_np[valid_group_idx_np, valid_slot_pos_np] = (
+            valid_beam_idx_np
+        )
+        logit_idx_by_slot_np[valid_group_idx_np, valid_slot_pos_np] = (
+            valid_logit_idx_np
+        )
 
         input_batch_idx_by_beam_np = np.full(
             (group_count, beam_width),
@@ -1645,9 +1595,7 @@ class BeamSearchMRV2Sampler:
             pin_memory=True,
         )
         valid_beam_mask_cpu.copy_(torch.from_numpy(valid_beam_mask_np))
-        active_slot_counts = tuple(
-            int(count) for count in valid_beam_mask_np.sum(axis=1)
-        )
+        active_slot_counts = tuple(int(count) for count in active_slot_counts_np)
 
         return _BeamView(
             gids=tuple(gids),
@@ -1697,7 +1645,7 @@ class BeamSearchMRV2Sampler:
         )
 
         n_cols = max(max_prefix_len, 1)
-        block_n = min(triton.next_power_of_2(n_cols), 1024)
+        block_n = _BEAM_STATE_BLOCK_N
         grid = (group_count, beam_width, triton.cdiv(n_cols, block_n))
         _rewrite_worker_tokens_kernel[grid](
             transitions.tokens,
@@ -1739,7 +1687,7 @@ class BeamSearchMRV2Sampler:
                     dtype=table.dtype,
                     device=table.device,
                 )
-                block_n = min(triton.next_power_of_2(max_prefix_blocks), 1024)
+                block_n = _BEAM_STATE_BLOCK_N
                 grid = (
                     group_count,
                     beam_width,
@@ -2057,22 +2005,44 @@ def _materialize_transition(data: dict[str, Any]) -> BeamTransition:
     completions: list[tuple[tuple[int, ...], float]] = []
     completion_scores = data.get("completion_scores")
     completion_sequences = data.get("completion_sequences")
+    completion_prefixes = data.get("completion_prefixes")
+    completion_slots = data.get("completion_slots")
+    completion_tokens = data.get("completion_tokens")
     if (
         completion_scores is not None
-        and completion_sequences is not None
         and completion_scores.numel() > 0
     ):
         scores = completion_scores.tolist()
-        sequences = completion_sequences.tolist()
-        completion_len = data.get("completion_len")
-        for seq, score in zip(sequences, scores):
-            if score <= _INIT_NEG / 2:
-                continue
-            if completion_len is not None:
-                seq = seq[: int(completion_len)]
-            completions.append(
-                (tuple(int(tok) for tok in seq), float(score))
-            )
+        if completion_sequences is not None:
+            sequences = completion_sequences.tolist()
+            completion_len = data.get("completion_len")
+            for seq, score in zip(sequences, scores):
+                if score <= _INIT_NEG / 2:
+                    continue
+                if completion_len is not None:
+                    seq = seq[: int(completion_len)]
+                completions.append(
+                    (tuple(int(tok) for tok in seq), float(score))
+                )
+        elif (
+            completion_prefixes is not None
+            and completion_slots is not None
+            and completion_tokens is not None
+        ):
+            slots = completion_slots.tolist()
+            tokens = completion_tokens.tolist()
+            for slot, token, score in zip(slots, tokens, scores):
+                if score <= _INIT_NEG / 2:
+                    continue
+                prefix = completion_prefixes[
+                    int(slot), prompt_len:prefix_len
+                ].tolist()
+                completions.append(
+                    (
+                        tuple(int(tok) for tok in (*prefix, int(token))),
+                        float(score),
+                    )
+                )
 
     return BeamTransition(
         group_id=str(data["gid"]),
