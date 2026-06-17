@@ -14,6 +14,9 @@ The current production path targets MRV2 generate models with async scheduling.
 The sampler hook is model-state generic; BART-family models still need the
 companion `vllm-bart-plugin` for encoder-decoder model support.
 
+For BART-family encoder-decoder serving, see
+[`BART_BEAM_SEARCH.md`](BART_BEAM_SEARCH.md).
+
 ## Install
 
 ```bash
