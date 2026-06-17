@@ -174,8 +174,6 @@ def _configure_beam_sampler_from_model_state(
 
 
 def _flash_attn_hopper_block_size_one_enabled() -> bool:
-    if not bool(int(os.getenv("VLLM_BEAM_FA3_BLOCK_SIZE_ONE", "1"))):
-        return False
     try:
         from vllm.platforms import current_platform
         from vllm.platforms.interface import DeviceCapability

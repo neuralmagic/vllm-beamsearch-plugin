@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from typing import Any
@@ -21,7 +20,6 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from .beam_types import _INIT_NEG, BeamRuntime, BeamTransition
 
 BEAM_TRANSITIONS_OUTPUT = "vllm_beam_search.transitions"
-_SYNC_CHECK = os.getenv("VLLM_BEAM_GPU_SYNC_CHECK")
 _NEG_INF = float("-inf")
 _GroupStateEntry = tuple[str, "_BeamGroupGpuState"]
 _SelectKey = tuple[int, int, int | None]
@@ -995,26 +993,6 @@ def _completion_lens(
     )
 
 
-@contextmanager
-def _gpu_sync_check():
-    if _SYNC_CHECK not in {"warn", "error"} or not torch.cuda.is_available():
-        yield
-        return
-
-    prev_mode = torch.cuda.get_sync_debug_mode()
-    torch.cuda.set_sync_debug_mode(_SYNC_CHECK)
-    try:
-        yield
-    except RuntimeError as exc:
-        if str(exc) == "called a synchronizing CUDA operation":
-            raise RuntimeError(
-                "GPU<->CPU sync detected in beam MRV2 sampler"
-            ) from exc
-        raise
-    finally:
-        torch.cuda.set_sync_debug_mode(prev_mode)
-
-
 class BeamSearchMRV2Sampler:
     """Beam-aware wrapper around MRV2's GPU sampler."""
 
@@ -1143,8 +1121,7 @@ class BeamSearchMRV2Sampler:
         if not self._has_beam_requests(input_batch):
             return self.base_sampler(logits, input_batch)
 
-        with _gpu_sync_check():
-            return self._sample_with_beam_logits(logits, input_batch)
+        return self._sample_with_beam_logits(logits, input_batch)
 
     def _has_beam_requests(self, input_batch: InputBatch) -> bool:
         return any(req_id in self.req_to_group for req_id in input_batch.req_ids)
@@ -1917,30 +1894,29 @@ class AsyncBeamTransitions:
 
     def to_cpu_nonblocking(self) -> "AsyncBeamTransitions":
         """Stage transition tensors for CPU finalization."""
-        with _gpu_sync_check():
-            tensors = self.tensors
-            if tensors is None:
-                assert self.gpu_transitions is not None
-                tensors = self._buffer_pool.snapshot(self.gpu_transitions)
+        tensors = self.tensors
+        if tensors is None:
+            assert self.gpu_transitions is not None
+            tensors = self._buffer_pool.snapshot(self.gpu_transitions)
 
-            cpu_tensors: dict[str, torch.Tensor | None] = {}
-            gpu_refs: list[torch.Tensor] = []
-            for key, value in tensors.items():
-                if value is None or value.device.type == "cpu":
-                    cpu_tensors[key] = value
-                    continue
-                cpu_tensors[key] = value.to("cpu", non_blocking=True)
-                gpu_refs.append(value)
-            return AsyncBeamTransitions(
-                tensors=cpu_tensors,
-                gids=self.gids,
-                steps=self.steps,
-                prefix_lens=self.prefix_lens,
-                prompt_lens=self.prompt_lens,
-                completion_lens=self.completion_lens,
-                gpu_refs=tuple(gpu_refs),
-                buffer_pool=self._buffer_pool,
-            )
+        cpu_tensors: dict[str, torch.Tensor | None] = {}
+        gpu_refs: list[torch.Tensor] = []
+        for key, value in tensors.items():
+            if value is None or value.device.type == "cpu":
+                cpu_tensors[key] = value
+                continue
+            cpu_tensors[key] = value.to("cpu", non_blocking=True)
+            gpu_refs.append(value)
+        return AsyncBeamTransitions(
+            tensors=cpu_tensors,
+            gids=self.gids,
+            steps=self.steps,
+            prefix_lens=self.prefix_lens,
+            prompt_lens=self.prompt_lens,
+            completion_lens=self.completion_lens,
+            gpu_refs=tuple(gpu_refs),
+            buffer_pool=self._buffer_pool,
+        )
 
     def to_output(self) -> tuple[BeamTransition, ...]:
         """Convert staged tensors into CPU BeamTransition records."""

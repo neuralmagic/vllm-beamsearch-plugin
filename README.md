@@ -17,13 +17,13 @@ companion `vllm-bart-plugin` for encoder-decoder model support.
 ## Install
 
 ```bash
-uv pip install -e /home/LucasWilkinson/local/vllm-beamsearch-plugin
+uv pip install -e .
 ```
 
 For stress tooling:
 
 ```bash
-uv pip install -e '/home/LucasWilkinson/local/vllm-beamsearch-plugin[stress]'
+uv pip install -e '.[stress]'
 ```
 
 ## Server
@@ -33,11 +33,9 @@ MODEL=${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}
 SERVED_MODEL=${SERVED_MODEL:-llama3-8b}
 
 CUDA_VISIBLE_DEVICES=0 \
-HF_HUB_CACHE=${HF_HUB_CACHE:-/mnt/data/engine/hub_cache} \
 VLLM_USE_V2_MODEL_RUNNER=1 \
 VLLM_USE_FLASHINFER_SAMPLER=0 \
-PYTHONPATH=/home/LucasWilkinson/local/vllm-beamsearch-plugin:${PYTHONPATH:-} \
-/home/LucasWilkinson/local/vllm/.venv/bin/python -m vllm.entrypoints.openai.api_server \
+python -m vllm.entrypoints.openai.api_server \
   --model "${MODEL}" \
   --served-model-name "${SERVED_MODEL}" \
   --dtype bfloat16 \
@@ -75,8 +73,7 @@ PYTHONPATH=/home/LucasWilkinson/local/vllm-beamsearch-plugin:${PYTHONPATH:-} \
 Run unit tests:
 
 ```bash
-/home/LucasWilkinson/local/vllm/.venv/bin/python -m pytest \
-  /home/LucasWilkinson/local/vllm-beamsearch-plugin/tests -q
+python -m pytest tests -q
 ```
 
 Run sustained stress plus memory sampling against a running server:
@@ -95,8 +92,5 @@ The stress tool writes CSV samples with request count, RSS, and GPU memory.
 
 ## Runtime Knobs
 
-- `VLLM_BEAM_FA3_BLOCK_SIZE_ONE=0` disables the Hopper FA3 block-size-1 patch.
-- `VLLM_BEAM_GPU_SYNC_CHECK=warn|error` enables PyTorch CUDA sync debugging
-  around beam sampler hot paths.
 - `VLLM_BEAM_GROUP_STATE_CAPACITY` controls GPU beam-state pool capacity.
 - `VLLM_BEAM_TRANSITION_BUFFER_SLOTS` controls async transition buffer slots.
