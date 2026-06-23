@@ -8,7 +8,6 @@ This package provides:
 - an MRV2 custom sampler wrapper installed through a plugin-local `ModelState`
   hook
 - plugin-local runtime hooks for MRV2 worker history rewrites
-- Hopper FA3 block-size-1 enablement for the beam-search path
 
 The current production path targets MRV2 generate models with async scheduling.
 The sampler hook is model-state generic; BART-family models still need the
@@ -36,23 +35,13 @@ MODEL=${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}
 SERVED_MODEL=${SERVED_MODEL:-llama3-8b}
 
 CUDA_VISIBLE_DEVICES=0 \
-VLLM_USE_V2_MODEL_RUNNER=1 \
 VLLM_USE_FLASHINFER_SAMPLER=0 \
 python -m vllm.entrypoints.openai.api_server \
   --model "${MODEL}" \
   --served-model-name "${SERVED_MODEL}" \
   --dtype bfloat16 \
   --port 8005 \
-  --block-size 16 \
-  --no-enable-prefix-caching \
-  --async-scheduling \
-  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler \
-  --max-num-seqs 512 \
-  --max-model-len 1024 \
-  --gpu-memory-utilization 0.9 \
-  --disable-log-stats \
-  --no-enable-log-requests \
-  --disable-uvicorn-access-log
+  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler
 ```
 
 ## Request Shape

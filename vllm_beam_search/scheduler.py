@@ -22,6 +22,7 @@ Per step (`update_from_output`):
 from __future__ import annotations
 
 import copy
+import inspect
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ logger = init_logger(__name__)
 
 
 def _install_worker_history_rewrite_hooks() -> None:
-    _patch_flash_attn_hopper_block_size_one()
+    _patch_mrv2_sampler_async_outputs()
     _patch_mrv2_model_state_beam_sampler()
     _patch_mrv2_gpu_model_runner_history_rewrites()
 
@@ -61,6 +62,66 @@ def _is_beam_scheduler_config(vllm_config: Any) -> bool:
         getattr(scheduler_cls, "__module__", None) == __name__
         and getattr(scheduler_cls, "__qualname__", "") == "BeamSearchScheduler"
     )
+
+
+def _patch_mrv2_sampler_async_outputs() -> None:
+    """Carry optional sampler async payloads through MRV2 AsyncOutput."""
+    try:
+        import vllm.v1.worker.gpu.async_utils as async_utils
+        import vllm.v1.worker.gpu.model_runner as model_runner_module
+    except ImportError:
+        return
+
+    original_async_output = async_utils.AsyncOutput
+    if getattr(original_async_output, "_vllm_beam_async_outputs_patched", False):
+        return
+
+    class BeamAsyncOutput(original_async_output):  # type: ignore[misc, valid-type]
+        def __init__(
+            self,
+            model_runner_output: Any,
+            sampler_output: Any,
+            num_sampled_tokens: Any,
+            main_stream: Any,
+            copy_stream: Any,
+        ) -> None:
+            super().__init__(
+                model_runner_output,
+                sampler_output,
+                num_sampled_tokens,
+                main_stream,
+                copy_stream,
+            )
+            self._vllm_beam_async_outputs = None
+            async_outputs = getattr(sampler_output, "async_outputs", None)
+            if not async_outputs:
+                return
+
+            staged: dict[str, Any] = {}
+            with async_utils.stream(copy_stream, main_stream):
+                copy_stream.wait_stream(main_stream)
+                for key, value in async_outputs.items():
+                    to_cpu = getattr(value, "to_cpu_nonblocking", None)
+                    staged[key] = to_cpu() if to_cpu is not None else value
+                self.copy_event.record(copy_stream)
+            self._vllm_beam_async_outputs = staged
+
+        def get_output(self) -> Any:
+            output = super().get_output()
+            async_outputs = self._vllm_beam_async_outputs
+            if not async_outputs:
+                return output
+
+            custom_outputs = dict(getattr(output, "custom_outputs", None) or {})
+            for key, value in async_outputs.items():
+                to_output = getattr(value, "to_output", None)
+                custom_outputs[key] = to_output() if to_output is not None else value
+            setattr(output, "custom_outputs", custom_outputs)
+            return output
+
+    BeamAsyncOutput._vllm_beam_async_outputs_patched = True
+    async_utils.AsyncOutput = BeamAsyncOutput
+    model_runner_module.AsyncOutput = BeamAsyncOutput
 
 
 def _patch_mrv2_model_state_beam_sampler() -> None:
@@ -171,71 +232,6 @@ def _configure_beam_sampler_from_model_state(
     forward_context = getattr(model_state, "_vllm_beam_forward_context", None)
     if kv_cache_config is not None and forward_context is not None:
         beam_sampler.set_kv_caches(kv_cache_config, forward_context)
-
-
-def _flash_attn_hopper_block_size_one_enabled() -> bool:
-    try:
-        from vllm.platforms import current_platform
-        from vllm.platforms.interface import DeviceCapability
-        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
-
-        capability = current_platform.get_device_capability()
-        return (
-            current_platform.is_cuda()
-            and capability is not None
-            and capability >= DeviceCapability(9, 0)
-            and capability < DeviceCapability(10, 0)
-            and get_flash_attn_version() == 3
-        )
-    except Exception:
-        return False
-
-
-def _patch_flash_attn_hopper_block_size_one() -> None:
-    """Advertise FA3 page-size-1 support on Hopper for beam experiments."""
-    try:
-        from vllm.v1.attention.backend import MultipleOf
-        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-    except Exception:
-        return
-
-    if getattr(FlashAttentionBackend, "_vllm_beam_fa3_bs1_patched", False):
-        return
-
-    original_supported = FlashAttentionBackend.get_supported_kernel_block_sizes
-    original_shape = FlashAttentionBackend.get_kv_cache_shape
-
-    def patched_supported() -> list[int | MultipleOf]:
-        try:
-            supported = list(original_supported())
-        except AssertionError:
-            supported = [MultipleOf(16)]
-        if _flash_attn_hopper_block_size_one_enabled() and 1 not in supported:
-            supported.insert(0, 1)
-        return supported
-
-    def patched_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size == 1 and _flash_attn_hopper_block_size_one_enabled():
-            return (num_blocks, 2, block_size, num_kv_heads, head_size)
-        return original_shape(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_size,
-            cache_dtype_str,
-        )
-
-    FlashAttentionBackend.get_supported_kernel_block_sizes = staticmethod(
-        patched_supported
-    )
-    FlashAttentionBackend.get_kv_cache_shape = staticmethod(patched_shape)
-    FlashAttentionBackend._vllm_beam_fa3_bs1_patched = True
 
 
 def _patch_mrv2_gpu_model_runner_history_rewrites() -> None:
@@ -572,8 +568,12 @@ class BeamSearchScheduler(Scheduler):
     # update_from_output
     # ------------------------------------------------------------------
 
-    def schedule(self) -> "SchedulerOutput":
-        scheduler_output = super().schedule()
+    def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
+        schedule = super().schedule
+        if inspect.signature(schedule).parameters:
+            scheduler_output = schedule(throttle_prefills)
+        else:
+            scheduler_output = schedule()
         self._clamp_async_beam_decode_chunks(scheduler_output)
         return scheduler_output
 

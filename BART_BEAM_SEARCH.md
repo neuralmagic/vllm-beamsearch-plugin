@@ -25,6 +25,68 @@ plugin loading with `VLLM_PLUGINS`, include both plugin entry points:
 export VLLM_PLUGINS=bart,beam_search
 ```
 
+## One-Shot Nightly
+
+To try the latest vLLM nightly without installing into the current environment,
+run the server with both plugin checkouts installed into an isolated `uv run`
+environment:
+
+```bash
+BART_PLUGIN=${BART_PLUGIN:-<bart-plugin-checkout>}
+BEAM_PLUGIN=${BEAM_PLUGIN:-<vllm-beamsearch-plugin-checkout>}
+MODEL=${MODEL:-facebook/bart-large-cnn}
+SERVED_MODEL=${SERVED_MODEL:-bart}
+
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_PLUGINS=bart,beam_search \
+VLLM_USE_FLASHINFER_SAMPLER=0 \
+UV_TORCH_BACKEND=auto \
+uv run --isolated --python 3.12 \
+  --with vllm \
+  --with 'tokenizers==0.22.1' \
+  --with-editable "${BART_PLUGIN}" \
+  --with-editable "${BEAM_PLUGIN}" \
+  --extra-index-url https://wheels.vllm.ai/nightly \
+  --prerelease allow \
+  -m vllm.entrypoints.openai.api_server \
+  --model "${MODEL}" \
+  --served-model-name "${SERVED_MODEL}" \
+  --dtype float16 \
+  --port 8005 \
+  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler
+```
+
+For pinned GitHub refs, use `--with` instead of `--with-editable`.
+Editable installs require a local checkout; Git refs are installed as normal
+package sources. These defaults use the beam-search plugin `main` branch and
+the BART plugin MRV2 cleanup branch; replace either ref with a commit hash for
+an immutable pin:
+
+```bash
+BART_PLUGIN_REF=${BART_PLUGIN_REF:-codex/bart-mrv2-plugin-cleanup}
+BEAM_PLUGIN_REF=${BEAM_PLUGIN_REF:-main}
+MODEL=${MODEL:-facebook/bart-large-cnn}
+SERVED_MODEL=${SERVED_MODEL:-bart}
+
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_PLUGINS=bart,beam_search \
+VLLM_USE_FLASHINFER_SAMPLER=0 \
+UV_TORCH_BACKEND=auto \
+uv run --isolated --python 3.12 \
+  --with vllm \
+  --with 'tokenizers==0.22.1' \
+  --with "vllm-bart-plugin @ git+https://github.com/vllm-project/bart-plugin.git@${BART_PLUGIN_REF}" \
+  --with "vllm-beam-search @ git+https://github.com/neuralmagic/vllm-beamsearch-plugin.git@${BEAM_PLUGIN_REF}" \
+  --extra-index-url https://wheels.vllm.ai/nightly \
+  --prerelease allow \
+  -m vllm.entrypoints.openai.api_server \
+  --model "${MODEL}" \
+  --served-model-name "${SERVED_MODEL}" \
+  --dtype float16 \
+  --port 8005 \
+  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler
+```
+
 ## Start Server
 
 ```bash
@@ -32,31 +94,20 @@ MODEL=${MODEL:-facebook/bart-large-cnn}
 SERVED_MODEL=${SERVED_MODEL:-bart}
 
 CUDA_VISIBLE_DEVICES=0 \
-VLLM_USE_V2_MODEL_RUNNER=1 \
 VLLM_USE_FLASHINFER_SAMPLER=0 \
 python -m vllm.entrypoints.openai.api_server \
   --model "${MODEL}" \
   --served-model-name "${SERVED_MODEL}" \
   --dtype float16 \
   --port 8005 \
-  --block-size 16 \
-  --no-enable-prefix-caching \
-  --async-scheduling \
-  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler \
-  --max-num-seqs 512 \
-  --max-model-len 1024 \
-  --gpu-memory-utilization 0.9 \
-  --disable-log-stats \
-  --no-enable-log-requests \
-  --disable-uvicorn-access-log
+  --scheduler-cls vllm_beam_search.scheduler.BeamSearchScheduler
 ```
 
 Notes:
 
 - `MODEL` can be a Hugging Face model ID or a local BART checkpoint path.
-- `VLLM_USE_V2_MODEL_RUNNER=1` and `--async-scheduling` are required by the
-  beam-search scheduler.
-- Prefix caching should stay disabled for this path.
+- The `tokenizers==0.22.1` pin avoids a current vLLM-nightly/BART tokenizer
+  construction issue.
 
 ## Send Request
 
@@ -103,7 +154,5 @@ vllm-beam-stress \
   and loaded: `python -c "import vllm_bart_plugin"`.
 - If beam search is not active, verify the request includes
   `vllm_xargs.beam_width` greater than 1.
-- If startup says the scheduler requires MRV2 with async scheduling, keep both
-  `VLLM_USE_V2_MODEL_RUNNER=1` and `--async-scheduling`.
 - If plugins are restricted, `VLLM_PLUGINS` must include both `bart` and
   `beam_search`.
